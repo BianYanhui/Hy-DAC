@@ -111,20 +111,68 @@ class LlamaAttention(nn.Module):
         """
         bsz, seqlen, _ = x.shape
         
-        # 计算Q, K, V
-        xq = self.wq(x)
-        xk = self.wk(x)
-        xv = self.wv(x)
-        
-        # Reshape
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        # 如果指定了compute_heads，只计算特定heads的Q, K, V
+        if compute_heads is not None:
+            # 转换head ID（1-based）为索引（0-based）
+            head_indices = [h - 1 for h in compute_heads if 1 <= h <= self.n_heads]
+            n_compute_heads = len(head_indices)
+            
+            # 使用高效的索引选择，避免循环和拼接
+            # Wq权重形状: [n_heads * head_dim, dim]
+            # 创建需要选择的列索引
+            dim_indices = []
+            for head_idx in head_indices:
+                dim_indices.extend(range(head_idx * self.head_dim, (head_idx + 1) * self.head_dim))
+            dim_indices = torch.tensor(dim_indices, device=self.wq.weight.device)
+            
+            # 使用index_select高效选择: [n_compute_heads * head_dim, dim]
+            wq_weight_selected = torch.index_select(self.wq.weight, 0, dim_indices)
+            
+            # 执行矩阵乘法: [batch, seq_len, dim] @ [dim, n_compute_heads * head_dim]
+            xq = torch.matmul(x, wq_weight_selected.t())  # [batch, seq_len, n_compute_heads * head_dim]
+            
+            # 对于GQA，K和V使用的是kv_heads，需要映射
+            # 计算每个Q head对应的KV head（GQA: 多个Q heads共享一个KV head）
+            n_rep = self.n_heads // self.n_kv_heads
+            kv_head_indices = sorted(list(set([h // n_rep for h in head_indices])))
+            n_compute_kv_heads = len(kv_head_indices)
+            
+            # 为KV heads创建索引
+            kv_dim_indices = []
+            for kv_head_idx in kv_head_indices:
+                kv_dim_indices.extend(range(kv_head_idx * self.head_dim, (kv_head_idx + 1) * self.head_dim))
+            kv_dim_indices = torch.tensor(kv_dim_indices, device=self.wk.weight.device)
+            
+            # 使用index_select选择KV权重
+            wk_weight_selected = torch.index_select(self.wk.weight, 0, kv_dim_indices)
+            wv_weight_selected = torch.index_select(self.wv.weight, 0, kv_dim_indices)
+            
+            xk = torch.matmul(x, wk_weight_selected.t())  # [batch, seq_len, n_compute_kv_heads * head_dim]
+            xv = torch.matmul(x, wv_weight_selected.t())
+            
+            # Reshape
+            xq = xq.view(bsz, seqlen, n_compute_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, n_compute_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, n_compute_kv_heads, self.head_dim)
+        else:
+            # 计算所有heads的Q, K, V（原始逻辑）
+            xq = self.wq(x)
+            xk = self.wk(x)
+            xv = self.wv(x)
+            
+            # Reshape
+            xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+            
+            n_compute_heads = self.n_heads
+            n_compute_kv_heads = self.n_kv_heads
+            head_indices = list(range(self.n_heads))
         
         # 应用RoPE
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
         
-        # 处理KV Cache
+        # 处理KV Cache（注意：如果只计算部分heads，KV cache也只包含对应的KV heads）
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
             # 拼接新的KV到cache
@@ -134,59 +182,52 @@ class LlamaAttention(nn.Module):
         # 新的KV cache
         new_kv_cache = (xk, xv)
         
-        # 如果指定了compute_heads，只计算特定的heads
-        if compute_heads is not None:
-            # 转换head ID（1-based）为索引（0-based）
-            head_indices = [h - 1 for h in compute_heads if 1 <= h <= self.n_heads]
-            # 只选择需要计算的heads
-            xq_selected = xq[:, :, head_indices, :]
-            n_compute_heads = len(head_indices)
-        else:
-            xq_selected = xq
-            n_compute_heads = self.n_heads
-            head_indices = list(range(self.n_heads))
-        
         # Transpose for attention: [batch, n_heads, seq_len, head_dim]
-        xq_selected = xq_selected.transpose(1, 2)
+        xq = xq.transpose(1, 2)  # 已经是选择后的heads
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
         
         # 计算注意力分数
         # 处理GQA (Grouped Query Attention)
-        if self.n_kv_heads < self.n_heads:
-            # 重复KV heads以匹配Q heads
+        # 当只计算部分heads时，我们已经只选择了对应的KV heads
+        # 需要将KV heads重复以匹配Q heads的数量
+        if compute_heads is not None:
+            # 已经选择了对应的KV heads，需要重复以匹配Q heads
+            # 计算每个KV head需要重复多少次
+            n_rep = self.n_heads // self.n_kv_heads
+            # 对于选中的Q heads，每个对应的KV head需要重复
+            if n_compute_kv_heads < n_compute_heads:
+                xk = xk.repeat_interleave(n_rep, dim=1)[:, :n_compute_heads, :, :]
+                xv = xv.repeat_interleave(n_rep, dim=1)[:, :n_compute_heads, :, :]
+        elif self.n_kv_heads < self.n_heads:
+            # 计算所有heads时的正常GQA处理
             n_rep = self.n_heads // self.n_kv_heads
             xk = xk.repeat_interleave(n_rep, dim=1)
             xv = xv.repeat_interleave(n_rep, dim=1)
-            
-            # 如果指定了compute_heads，需要选择对应的KV heads
-            if compute_heads is not None:
-                xk = xk[:, head_indices, :, :]
-                xv = xv[:, head_indices, :, :]
         
         # Attention
-        scores = torch.matmul(xq_selected, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
         if mask is not None:
             scores = scores + mask
         
-        scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq_selected)
+        scores = torch.nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, xv)
         
         # Reshape back
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, n_compute_heads * self.head_dim)
         
-        # 如果只计算了部分heads，需要创建完整的输出（其他位置填0）
+        # Output projection（也只使用对应heads的权重）
         if compute_heads is not None and n_compute_heads < self.n_heads:
-            full_output = torch.zeros(bsz, seqlen, self.n_heads * self.head_dim, 
-                                     dtype=output.dtype, device=output.device)
-            for i, head_idx in enumerate(head_indices):
-                full_output[:, :, head_idx*self.head_dim:(head_idx+1)*self.head_dim] = \
-                    output[:, :, i*self.head_dim:(i+1)*self.head_dim]
-            output = full_output
-        
-        # Output projection
-        output = self.wo(output)
+            # Wo权重形状: [dim, n_heads * head_dim]
+            # 使用index_select选择对应heads的列
+            wo_weight_selected = torch.index_select(self.wo.weight, 1, dim_indices)
+            
+            # 执行矩阵乘法: [batch, seq_len, n_compute_heads * head_dim] @ [n_compute_heads * head_dim, dim]
+            output = torch.matmul(output, wo_weight_selected.t())  # [batch, seq_len, dim]
+        else:
+            # 计算所有heads时使用完整的wo
+            output = self.wo(output)
         
         return output, new_kv_cache
 

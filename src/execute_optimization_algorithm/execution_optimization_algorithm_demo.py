@@ -1,7 +1,7 @@
-"""
-分布式推理系统执行优化算法Demo
+[""]
+分布式推理系统执行优化算(Demo
 模拟多设备分布式推理场景，演示设备下线后的KV-Cache复用优化策略,
-使用真实的Llama-3.2-1B模型进行推理
+使用真实的Llama-3.2-1B模型进行推理)
 """
 import threading
 import time
@@ -15,6 +15,7 @@ from heartbeat_detection import HeartbeatDetector
 from task_reassign import TaskReassigner
 from kv_cache_reused import KVCacheManager
 from llama_model_loader import LlamaModel
+from performance_comparator import PerformanceComparator
 
 
 class Worker:
@@ -73,7 +74,7 @@ class Leader:
     
     def __init__(self, leader_id: str, assigned_heads: List[int], 
                  kv_cache_manager: KVCacheManager, task_reassigner: TaskReassigner,
-                 heartbeat_detector: HeartbeatDetector):
+                 heartbeat_detector: HeartbeatDetector, performance_comparator: PerformanceComparator = None):
         """
         初始化Leader
         
@@ -83,12 +84,14 @@ class Leader:
             kv_cache_manager: KV-Cache管理器
             task_reassigner: 任务重分配器
             heartbeat_detector: 心跳检测器
+            performance_comparator: 性能对比器
         """
         self.leader_id = leader_id
         self.assigned_heads = assigned_heads.copy()
         self.kv_cache_manager = kv_cache_manager
         self.task_reassigner = task_reassigner
         self.heartbeat_detector = heartbeat_detector
+        self.performance_comparator = performance_comparator or PerformanceComparator()
         self.workers: Dict[str, Worker] = {}
         self.lock = threading.Lock()
         
@@ -133,19 +136,30 @@ class Leader:
         # 移除失败Worker的KV-Cache
         self.kv_cache_manager.remove_worker_cache(failed_worker_id)
         
-        # 执行KV-Cache复用和重计算
+        # 执行KV-Cache复用和重计算（传入failed_worker_id用于对比）
         print(f"\n[Leader-{self.leader_id}] 开始执行 KV-Cache 复用和重计算...")
-        self._perform_cache_reuse_and_recompute(new_assignments)
+        self._perform_cache_reuse_and_recompute(failed_worker_id, new_assignments)
         
         print(f"\n{'='*60}")
         print(f"[Leader-{self.leader_id}] ✅ 故障恢复完成!")
         print(f"{'='*60}\n")
     
-    def _perform_cache_reuse_and_recompute(self, new_assignments: Dict[str, List[int]]):
-        """执行KV-Cache复用和重计算"""
+    def _perform_cache_reuse_and_recompute(self, failed_worker_id: str, new_assignments: Dict[str, List[int]]):
+        """执行KV-Cache复用和重计算（优化方法），并与传统方法对比"""
         total_reused = 0
         total_recomputed = 0
         total_time = 0.0
+        
+        print(f"\n{'='*60}")
+        print("方法对比：KV-Cache复用 vs 完全重计算")
+        print(f"{'='*60}")
+        
+        # 1. 首先计算传统方法的耗时（完全重计算所有32个heads）
+        print(f"\n【传统方法】完全重计算所有KV-Cache（丢弃所有已有cache，重新计算32个heads）")
+        traditional_time = self._calculate_traditional_recompute_time(failed_worker_id)
+        
+        # 2. 执行我们的优化方法（KV-Cache复用）
+        print(f"\n【优化方法】KV-Cache复用 + 部分重计算")
         
         for worker_id, new_heads in new_assignments.items():
             print(f"\n[处理 {worker_id}]")
@@ -173,15 +187,86 @@ class Leader:
                     self.assigned_heads = self.task_reassigner.get_worker_heads(worker_id)
                     print(f"[Leader-{self.leader_id}] 更新自己的任务，现在负责 Heads: {self.assigned_heads}")
         
-        # 打印统计信息
+        # 打印对比统计信息
+        self._print_comparison_statistics(traditional_time, total_time, total_reused, total_recomputed)
+        
+        # 记录到性能对比器
+        self.performance_comparator.add_comparison(
+            scenario=f"设备下线恢复",
+            traditional_time=traditional_time,
+            optimized_time=total_time,
+            total_heads=total_reused + total_recomputed,
+            reused_heads=total_reused,
+            recomputed_heads=total_recomputed
+        )
+    
+    def _calculate_traditional_recompute_time(self, failed_worker_id: str) -> float:
+        """
+        计算传统方法（完全重计算）的真实耗时
+        传统方法：丢弃所有已有的KV-Cache，从头开始重新计算所有32个heads
+        
+        Args:
+            failed_worker_id: 失败的Worker ID（用于日志）
+            
+        Returns:
+            传统方法的真实总耗时（秒）
+        """
+        import time as time_module
+        
+        print(f"  传统方法：丢弃所有KV-Cache，完全重新计算所有32个heads...")
+        
+        # 传统方法需要重新计算所有32个heads（整个模型）
+        all_heads = list(range(1, 33))  # heads 1-32
+        
+        # 真实执行完全重计算
+        start_time = time_module.time()
+        actual_time = self.kv_cache_manager.compute_kv_cache_for_heads_no_print(
+            "traditional_full_recompute", all_heads, seq_length=32
+        )
+        
+        print(f"  传统方法完成，实际耗时 {actual_time:.3f}秒（重新计算了32个heads）")
+        
+        return actual_time
+    
+    def _print_comparison_statistics(self, traditional_time: float, optimized_time: float, 
+                                    reused_count: int, recomputed_count: int):
+        """
+        打印对比统计信息
+        
+        Args:
+            traditional_time: 传统方法耗时
+            optimized_time: 优化方法耗时
+            reused_count: 复用的头部数量
+            recomputed_count: 重计算的头部数量
+        """
         print(f"\n{'='*60}")
-        print(f"KV-Cache 复用统计:")
-        print(f"  复用的头部数量: {total_reused}")
-        print(f"  重新计算的头部数量: {total_recomputed}")
-        print(f"  重计算总耗时: {total_time:.3f} 秒")
-        if total_reused + total_recomputed > 0:
-            reuse_ratio = total_reused / (total_reused + total_recomputed) * 100
+        print("性能对比结果:")
+        print(f"{'='*60}")
+        
+        print(f"\n传统方法（完全重计算）:")
+        print(f"  重计算头部数量: {reused_count + recomputed_count} 个")
+        print(f"  总耗时: {traditional_time:.3f} 秒")
+        
+        print(f"\n优化方法（KV-Cache复用）:")
+        print(f"  ✓ 复用的头部数量: {reused_count} 个")
+        print(f"  ✗ 重新计算的头部数量: {recomputed_count} 个")
+        print(f"  总耗时: {optimized_time:.3f} 秒")
+        
+        if reused_count + recomputed_count > 0:
+            reuse_ratio = reused_count / (reused_count + recomputed_count) * 100
             print(f"  复用率: {reuse_ratio:.1f}%")
+        
+        # 计算性能提升
+        if traditional_time > 0:
+            time_saved = traditional_time - optimized_time
+            speedup = traditional_time / optimized_time if optimized_time > 0 else float('inf')
+            improvement = (time_saved / traditional_time) * 100
+            
+            print(f"\n性能提升:")
+            print(f"  节省时间: {time_saved:.3f} 秒")
+            print(f"  加速比: {speedup:.2f}x")
+            print(f"  性能提升: {improvement:.1f}%")
+        
         print(f"{'='*60}")
 
 
@@ -220,6 +305,7 @@ class DistributedInferenceSystem:
         )
         self.task_reassigner = TaskReassigner()
         self.heartbeat_detector = HeartbeatDetector(check_interval=2.0, timeout=5.0)
+        self.performance_comparator = PerformanceComparator()
         
         # 初始化任务分配
         self.initial_assignments = self._create_initial_assignments()
@@ -232,7 +318,8 @@ class DistributedInferenceSystem:
             self.initial_assignments[leader_id],
             self.kv_cache_manager,
             self.task_reassigner,
-            self.heartbeat_detector
+            self.heartbeat_detector,
+            self.performance_comparator
         )
         
         # 初始化Leader的KV-Cache
@@ -321,6 +408,14 @@ class DistributedInferenceSystem:
             worker.stop()
         
         print(f"[System] 系统已关闭")
+    
+    def print_performance_report(self):
+        """打印性能对比报告"""
+        self.performance_comparator.print_report()
+    
+    def save_performance_report(self, filepath: str):
+        """保存性能对比报告"""
+        self.performance_comparator.save_report(filepath)
 
 
 def main():
@@ -367,6 +462,13 @@ def main():
     
     # 停止系统
     system.stop()
+    
+    # 生成并打印性能对比报告
+    system.print_performance_report()
+    
+    # 保存报告到文件
+    report_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/20251201-JSAC-Hy-DAC/Hy-DAC-Code/Hy-DAC/src/execute_optimization_algorithm/kv_cache_performance_report.txt"
+    system.save_performance_report(report_path)
     
     print("\n[Demo] Demo运行完成!\n")
 

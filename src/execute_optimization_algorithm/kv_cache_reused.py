@@ -101,14 +101,19 @@ class KVCacheManager:
         print(f"[KVCacheManager] Worker {worker_id} 开始计算 Heads {heads} 的 KV-Cache...")
         
         if self.llama_model is not None:
-            # 真实推理：批量计算
+            # 真实推理：计算指定的heads
             input_ids = torch.randint(0, 1000, (1, seq_length), device=self.llama_model.device)
             
-            # 批量计算所有heads
+            print(f"  [DEBUG] 正在计算 {len(heads)} 个heads")
+            
+            # 计算指定的heads
+            compute_start = time.time()
             with torch.no_grad():
                 _, kv_cache_list = self.llama_model.compute_with_heads(
                     input_ids, heads, kv_cache_list=None
                 )
+            compute_time = time.time() - compute_start
+            print(f"  [DEBUG] 模型计算耗时: {compute_time:.3f}秒")
             
             # 保存所有heads的KV cache
             for head in heads:
@@ -129,6 +134,63 @@ class KVCacheManager:
         elapsed = time.time() - start_time
         print(f"[KVCacheManager] Worker {worker_id} 完成 Heads {heads} 的 KV-Cache 计算，耗时: {elapsed:.3f}秒")
         
+        return elapsed
+    
+    def compute_kv_cache_for_heads_no_print(self, worker_id: str, heads: List[int], 
+                                           seq_length: int = 32) -> float:
+        """
+        为指定的头部计算KV-Cache（真实计算，不打印详细信息）
+        用于传统方法的性能测试
+        
+        Args:
+            worker_id: Worker ID
+            heads: 需要计算的头部列表
+            seq_length: 序列长度
+            
+        Returns:
+            计算耗时（秒）
+        """
+        start_time = time.time()
+        
+        # 创建临时的worker_id，不影响实际的cache
+        temp_worker_id = f"{worker_id}_temp"
+        if temp_worker_id not in self.kv_caches:
+            self.kv_caches[temp_worker_id] = {}
+        
+        if self.llama_model is not None:
+            # 真实推理：计算指定的heads
+            input_ids = torch.randint(0, 1000, (1, seq_length), device=self.llama_model.device)
+            
+            print(f"  [DEBUG] 正在计算 {len(heads)} 个heads: {heads[:3]}...{heads[-3:] if len(heads) > 6 else ''}")
+            
+            # 计算指定的heads
+            compute_start = time.time()
+            with torch.no_grad():
+                _, kv_cache_list = self.llama_model.compute_with_heads(
+                    input_ids, heads, kv_cache_list=None
+                )
+            compute_time = time.time() - compute_start
+            print(f"  [DEBUG] 模型计算耗时: {compute_time:.3f}秒")
+            
+            # 保存到临时cache（测试完会清理）
+            for head in heads:
+                self.kv_caches[temp_worker_id][head] = kv_cache_list
+        else:
+            # 模拟模式
+            for head in heads:
+                kv_cache_list = []
+                for _ in range(self.num_layers):
+                    k_cache = torch.randn(1, seq_length, 8, self.hidden_size)
+                    v_cache = torch.randn(1, seq_length, 8, self.hidden_size)
+                    kv_cache_list.append((k_cache, v_cache))
+                self.kv_caches[temp_worker_id][head] = kv_cache_list
+                time.sleep(0.05)
+        
+        # 清理临时cache
+        if temp_worker_id in self.kv_caches:
+            del self.kv_caches[temp_worker_id]
+        
+        elapsed = time.time() - start_time
         return elapsed
     
     def reuse_cache_and_compute_new(self, worker_id: str, old_heads: List[int], 
