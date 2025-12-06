@@ -1,97 +1,85 @@
-"""Task reassignment helpers for the distributed inference demo."""
-
-from __future__ import annotations
-
-import math
+"""
+任务重分配模块
+负责在Worker下线时重新分配计算任务（Heads）
+"""
 import random
 from typing import Dict, List, Tuple
 
 
 class TaskReassigner:
-	"""Assigns attention heads to workers and redistributes them after failures."""
-
-	def __init__(self, worker_ratios: Dict[str, float], seed: int | None = None) -> None:
-		if not worker_ratios:
-			raise ValueError("worker_ratios cannot be empty")
-
-		total_ratio = sum(worker_ratios.values())
-		if total_ratio <= 0:
-			raise ValueError("sum of worker ratios must be > 0")
-
-		self._ratios = {worker: ratio / total_ratio for worker, ratio in worker_ratios.items() if ratio > 0}
-		if not self._ratios:
-			raise ValueError("at least one worker ratio must be > 0")
-
-		self._rng = random.Random(seed)
-
-	def initial_assignment(self, total_heads: int) -> Dict[str, List[int]]:
-		"""Creates an initial mapping of heads to workers."""
-
-		if total_heads <= 0:
-			raise ValueError("total_heads must be > 0")
-
-		assignments: Dict[str, List[int]] = {worker: [] for worker in self._ratios}
-		proportional_counts = {worker: int(math.floor(total_heads * ratio)) for worker, ratio in self._ratios.items()}
-
-		assigned = sum(proportional_counts.values())
-		leftovers = total_heads - assigned
-
-		# Distribute leftover heads by descending ratio to keep ordering deterministic.
-		if leftovers > 0:
-			for worker, _ in sorted(self._ratios.items(), key=lambda item: item[1], reverse=True):
-				if leftovers == 0:
-					break
-				proportional_counts[worker] += 1
-				leftovers -= 1
-
-		head_id = 0
-		for worker, count in proportional_counts.items():
-			assignments[worker] = list(range(head_id, head_id + count))
-			head_id += count
-
-		return assignments
-
-	def reassign(
-		self,
-		offline_worker: str,
-		current_assignments: Dict[str, List[int]],
-	) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
-		"""Redistributes heads from the offline worker to remaining workers."""
-
-		if offline_worker not in current_assignments:
-			return current_assignments, {}
-
-		offline_heads = current_assignments.pop(offline_worker)
-		if not offline_heads:
-			return current_assignments, {}
-
-		destinations = [worker for worker in current_assignments if worker != offline_worker]
-		if not destinations:
-			return current_assignments, {}
-
-		new_assignments: Dict[str, List[int]] = {worker: [] for worker in destinations}
-
-		for head in offline_heads:
-			target = self._select_worker_for_head(destinations)
-			current_assignments.setdefault(target, []).append(head)
-			new_assignments[target].append(head)
-
-		# Keep head ordering deterministic for readability.
-		for worker in current_assignments:
-			current_assignments[worker] = sorted(current_assignments[worker])
-
-		return current_assignments, {worker: heads for worker, heads in new_assignments.items() if heads}
-
-	def _select_worker_for_head(self, candidates: List[str]) -> str:
-		weights = [self._ratios.get(worker, 0.0) for worker in candidates]
-		total = sum(weights)
-		if total == 0:
-			return self._rng.choice(candidates)
-		threshold = self._rng.random() * total
-		cumulative = 0.0
-		for worker, weight in zip(candidates, weights):
-			cumulative += weight
-			if cumulative >= threshold:
-				return worker
-		return candidates[-1]
-
+    """任务重分配器"""
+    
+    def __init__(self):
+        """初始化任务重分配器"""
+        self.head_assignments: Dict[str, List[int]] = {}  # worker_id -> [heads]
+        
+    def initialize_assignments(self, assignments: Dict[str, List[int]]):
+        """
+        初始化头部分配
+        
+        Args:
+            assignments: 初始的头部分配，格式为 {worker_id: [head1, head2, ...]}
+        """
+        self.head_assignments = {k: v.copy() for k, v in assignments.items()}
+        print("[TaskReassigner] 初始任务分配:")
+        for worker_id, heads in self.head_assignments.items():
+            print(f"  {worker_id}: Heads {heads}")
+    
+    def reassign_failed_worker(self, failed_worker_id: str, alive_workers: List[str]) -> Dict[str, List[int]]:
+        """
+        重新分配失败Worker的任务
+        
+        Args:
+            failed_worker_id: 失败的Worker ID
+            alive_workers: 存活的Worker ID列表
+            
+        Returns:
+            新分配的任务字典，格式为 {worker_id: [new_heads]}
+        """
+        if failed_worker_id not in self.head_assignments:
+            print(f"[TaskReassigner] Worker {failed_worker_id} 不存在于任务列表中")
+            return {}
+        
+        # 获取失败Worker的所有头部
+        failed_heads = self.head_assignments[failed_worker_id]
+        if not failed_heads:
+            print(f"[TaskReassigner] Worker {failed_worker_id} 没有分配任何头部")
+            return {}
+        
+        print(f"[TaskReassigner] Worker {failed_worker_id} 下线，需要重新分配 Heads: {failed_heads}")
+        
+        # 移除失败Worker
+        del self.head_assignments[failed_worker_id]
+        
+        # 过滤出仍然存活的Worker
+        valid_workers = [w for w in alive_workers if w in self.head_assignments]
+        
+        if not valid_workers:
+            print(f"[TaskReassigner] ⚠️ 没有存活的Worker可以接收任务!")
+            return {}
+        
+        # 简单策略：随机选择一个Worker来接收所有失败的头部
+        # （实际应用中可以使用更复杂的负载均衡策略）
+        target_worker = random.choice(valid_workers)
+        
+        print(f"[TaskReassigner] 将 Heads {failed_heads} 重新分配给 {target_worker}")
+        
+        # 分配头部到目标Worker
+        self.head_assignments[target_worker].extend(failed_heads)
+        
+        # 返回新分配的任务
+        new_assignments = {target_worker: failed_heads}
+        
+        print("[TaskReassigner] 重分配后的任务分配:")
+        for worker_id, heads in self.head_assignments.items():
+            print(f"  {worker_id}: Heads {heads}")
+        
+        return new_assignments
+    
+    def get_current_assignments(self) -> Dict[str, List[int]]:
+        """获取当前的任务分配"""
+        return {k: v.copy() for k, v in self.head_assignments.items()}
+    
+    def get_worker_heads(self, worker_id: str) -> List[int]:
+        """获取指定Worker的头部列表"""
+        return self.head_assignments.get(worker_id, []).copy()
