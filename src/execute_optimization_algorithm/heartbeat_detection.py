@@ -1,101 +1,356 @@
+""",
+心跳检测模块 (Heartbeat Detection Module)
+
+该模块实现了分布式系统中的心跳检测机制。
+Leader定期向所有Worker发送心跳请求，以检测Worker是否在线。
+如果Worker在指定时间内没有响应，则认为该Worker已离线。
 """
-心跳检测模块
-负责Leader定期检测Worker的存活状态
-"""
-import threading
+
 import time
-from typing import Dict, Set, Callable
+import threading
+from typing import Dict, List, Callable, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+import queue
+
+
+class DeviceStatus(Enum):
+    """设备状态枚举"""
+    ONLINE = "online"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class HeartbeatRecord:
+    """心跳记录"""
+    device_id: str
+    last_heartbeat_time: float = 0.0
+    status: DeviceStatus = DeviceStatus.UNKNOWN
+    consecutive_failures: int = 0
+    total_heartbeats: int = 0
+    total_failures: int = 0
 
 
 class HeartbeatDetector:
-    """心跳检测器"""
+    """
+    心跳检测器
     
-    def __init__(self, check_interval: float = 2.0, timeout: float = 5.0):
+    Leader使用该类来检测所有Worker的存活状态。
+    采用线程模拟实际的网络心跳检测。
+    """
+    
+    def __init__(self, 
+                 heartbeat_interval: float = 1.0,
+                 timeout: float = 0.5,
+                 max_failures: int = 3,
+                 on_device_offline: Optional[Callable[[str], None]] = None,
+                 on_device_online: Optional[Callable[[str], None]] = None):
         """
         初始化心跳检测器
         
         Args:
-            check_interval: 心跳检测间隔（秒）
-            timeout: 心跳超时时间（秒）
+            heartbeat_interval: 心跳检测间隔（秒）
+            timeout: 单次心跳响应超时时间（秒）
+            max_failures: 连续失败多少次后认为设备离线
+            on_device_offline: 设备离线时的回调函数
+            on_device_online: 设备上线时的回调函数
         """
-        self.check_interval = check_interval
+        self.heartbeat_interval = heartbeat_interval
         self.timeout = timeout
-        self.worker_last_heartbeat: Dict[str, float] = {}
-        self.failed_workers: Set[str] = set()
+        self.max_failures = max_failures
+        self.on_device_offline = on_device_offline
+        self.on_device_online = on_device_online
+        
+        # 设备记录
+        self.devices: Dict[str, HeartbeatRecord] = {}
+        
+        # 设备响应队列 - 用于模拟心跳响应
+        self.response_queues: Dict[str, queue.Queue] = {}
+        
+        # 控制标志
         self.running = False
-        self.detection_thread = None
-        self.failure_callback = None
+        self.detector_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         
-    def register_worker(self, worker_id: str):
-        """注册一个Worker"""
+        # 手动设置的离线设备（用于模拟）
+        self.simulated_offline_devices: Set[str] = set()
+    
+    def register_device(self, device_id: str):
+        """
+        注册设备到心跳检测
+        
+        Args:
+            device_id: 设备ID
+        """
         with self.lock:
-            self.worker_last_heartbeat[worker_id] = time.time()
-            print(f"[HeartbeatDetector] Worker {worker_id} 已注册")
+            if device_id not in self.devices:
+                self.devices[device_id] = HeartbeatRecord(
+                    device_id=device_id,
+                    last_heartbeat_time=time.time(),
+                    status=DeviceStatus.ONLINE
+                )
+                self.response_queues[device_id] = queue.Queue()
+                print(f"[Heartbeat] Device {device_id} registered")
     
-    def receive_heartbeat(self, worker_id: str):
-        """接收Worker的心跳"""
+    def unregister_device(self, device_id: str):
+        """注销设备"""
         with self.lock:
-            if worker_id in self.worker_last_heartbeat:
-                self.worker_last_heartbeat[worker_id] = time.time()
-                # print(f"[HeartbeatDetector] 收到 Worker {worker_id} 的心跳")
+            if device_id in self.devices:
+                del self.devices[device_id]
+            if device_id in self.response_queues:
+                del self.response_queues[device_id]
     
-    def set_failure_callback(self, callback: Callable[[str], None]):
-        """设置Worker失败时的回调函数"""
-        self.failure_callback = callback
+    def simulate_device_offline(self, device_id: str):
+        """
+        模拟设备离线（用于测试）
+        
+        Args:
+            device_id: 要模拟离线的设备ID
+        """
+        with self.lock:
+            self.simulated_offline_devices.add(device_id)
+            print(f"[Heartbeat] Simulating {device_id} going offline...")
     
-    def start_detection(self):
+    def simulate_device_online(self, device_id: str):
+        """模拟设备恢复在线"""
+        with self.lock:
+            self.simulated_offline_devices.discard(device_id)
+            if device_id in self.devices:
+                self.devices[device_id].consecutive_failures = 0
+    
+    def _send_heartbeat(self, device_id: str) -> bool:
+        """
+        向设备发送心跳请求
+        
+        Returns:
+            是否收到响应
+        """
+        # 检查是否被模拟为离线
+        if device_id in self.simulated_offline_devices:
+            return False
+        
+        # 模拟网络延迟
+        time.sleep(0.01)  # 10ms的模拟延迟
+        
+        # 正常情况下设备会响应
+        return True
+    
+    def _check_device(self, device_id: str):
+        """检查单个设备的心跳"""
+        record = self.devices.get(device_id)
+        if not record:
+            return
+        
+        record.total_heartbeats += 1
+        
+        # 发送心跳并等待响应
+        response = self._send_heartbeat(device_id)
+        
+        with self.lock:
+            if response:
+                # 收到响应
+                old_status = record.status
+                record.last_heartbeat_time = time.time()
+                record.consecutive_failures = 0
+                record.status = DeviceStatus.ONLINE
+                
+                # 如果之前是离线状态，触发上线回调
+                if old_status == DeviceStatus.OFFLINE:
+                    if self.on_device_online:
+                        self.on_device_online(device_id)
+                    print(f"[Heartbeat] Device {device_id} is back ONLINE")
+            else:
+                # 没有响应
+                record.consecutive_failures += 1
+                record.total_failures += 1
+                
+                if record.consecutive_failures >= self.max_failures:
+                    if record.status != DeviceStatus.OFFLINE:
+                        record.status = DeviceStatus.OFFLINE
+                        print(f"[Heartbeat] Device {device_id} detected as OFFLINE "
+                              f"(no response for {self.max_failures} consecutive checks)")
+                        
+                        # 触发离线回调
+                        if self.on_device_offline:
+                            # 在新线程中执行回调，避免阻塞心跳检测
+                            threading.Thread(
+                                target=self.on_device_offline,
+                                args=(device_id,),
+                                daemon=True
+                            ).start()
+    
+    def _heartbeat_loop(self):
+        """心跳检测主循环"""
+        print("[Heartbeat] Heartbeat detection started")
+        
+        while self.running:
+            start_time = time.time()
+            
+            # 获取当前所有设备ID的快照
+            with self.lock:
+                device_ids = list(self.devices.keys())
+            
+            # 检查每个设备
+            for device_id in device_ids:
+                if not self.running:
+                    break
+                self._check_device(device_id)
+            
+            # 计算需要等待的时间
+            elapsed = time.time() - start_time
+            sleep_time = max(0, self.heartbeat_interval - elapsed)
+            
+            if self.running and sleep_time > 0:
+                time.sleep(sleep_time)
+        
+        print("[Heartbeat] Heartbeat detection stopped")
+    
+    def start(self):
         """启动心跳检测"""
         if self.running:
-            print("[HeartbeatDetector] 心跳检测已在运行")
             return
         
         self.running = True
-        self.detection_thread = threading.Thread(target=self._detection_loop, daemon=True)
-        self.detection_thread.start()
-        print("[HeartbeatDetector] 心跳检测已启动")
+        self.detector_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name="HeartbeatDetector"
+        )
+        self.detector_thread.start()
     
-    def stop_detection(self):
+    def stop(self):
         """停止心跳检测"""
         self.running = False
-        if self.detection_thread:
-            self.detection_thread.join()
-        print("[HeartbeatDetector] 心跳检测已停止")
+        if self.detector_thread:
+            self.detector_thread.join(timeout=2.0)
+            self.detector_thread = None
     
-    def _detection_loop(self):
-        """心跳检测循环"""
-        while self.running:
-            time.sleep(self.check_interval)
-            self._check_workers()
-    
-    def _check_workers(self):
-        """检查所有Worker的心跳状态"""
-        current_time = time.time()
-        newly_failed_workers = []
-        
+    def get_device_status(self, device_id: str) -> DeviceStatus:
+        """获取设备状态"""
         with self.lock:
-            for worker_id, last_heartbeat in list(self.worker_last_heartbeat.items()):
-                # 如果已经标记为失败，跳过
-                if worker_id in self.failed_workers:
-                    continue
-                
-                # 检查是否超时
-                if current_time - last_heartbeat > self.timeout:
-                    print(f"[HeartbeatDetector] ⚠️ Worker {worker_id} 心跳超时!")
-                    self.failed_workers.add(worker_id)
-                    newly_failed_workers.append(worker_id)
-        
-        # 在锁外调用回调，避免死锁
-        if self.failure_callback:
-            for worker_id in newly_failed_workers:
-                self.failure_callback(worker_id)
+            if device_id in self.devices:
+                return self.devices[device_id].status
+            return DeviceStatus.UNKNOWN
     
-    def get_failed_workers(self) -> Set[str]:
-        """获取已失败的Worker列表"""
+    def get_all_status(self) -> Dict[str, DeviceStatus]:
+        """获取所有设备状态"""
         with self.lock:
-            return self.failed_workers.copy()
+            return {
+                device_id: record.status
+                for device_id, record in self.devices.items()
+            }
     
-    def is_worker_alive(self, worker_id: str) -> bool:
-        """检查Worker是否存活"""
+    def get_online_devices(self) -> List[str]:
+        """获取所有在线设备"""
         with self.lock:
-            return worker_id not in self.failed_workers
+            return [
+                device_id for device_id, record in self.devices.items()
+                if record.status == DeviceStatus.ONLINE
+            ]
+    
+    def get_offline_devices(self) -> List[str]:
+        """获取所有离线设备"""
+        with self.lock:
+            return [
+                device_id for device_id, record in self.devices.items()
+                if record.status == DeviceStatus.OFFLINE
+            ]
+    
+    def get_statistics(self) -> Dict:
+        """获取心跳检测统计信息"""
+        with self.lock:
+            return {
+                device_id: {
+                    "status": record.status.value,
+                    "last_heartbeat": record.last_heartbeat_time,
+                    "consecutive_failures": record.consecutive_failures,
+                    "total_heartbeats": record.total_heartbeats,
+                    "total_failures": record.total_failures,
+                    "success_rate": (
+                        (record.total_heartbeats - record.total_failures) / 
+                        record.total_heartbeats * 100
+                        if record.total_heartbeats > 0 else 0
+                    )
+                }
+                for device_id, record in self.devices.items()
+            }
+    
+    def print_status(self):
+        """打印当前状态"""
+        stats = self.get_statistics()
+        print("\n" + "="*60)
+        print("Heartbeat Detection Status")
+        print("="*60)
+        for device_id, info in stats.items():
+            status = info["status"].upper()
+            success_rate = info["success_rate"]
+            print(f"  {device_id}: [{status}] Success Rate: {success_rate:.1f}%")
+        print("="*60 + "\n")
+
+
+class WorkerHeartbeatResponder:
+    """
+    Worker端心跳响应器
+    
+    Worker使用该类来响应Leader的心跳请求。
+    """
+    
+    def __init__(self, device_id: str):
+        self.device_id = device_id
+        self.running = False
+        self.is_responsive = True  # 用于模拟离线
+    
+    def set_responsive(self, responsive: bool):
+        """设置是否响应心跳"""
+        self.is_responsive = responsive
+    
+    def respond_to_heartbeat(self) -> bool:
+        """响应心跳请求"""
+        if not self.is_responsive:
+            return False
+        return True
+
+
+if __name__ == "__main__":
+    # 测试代码
+    print("Testing Heartbeat Detection Module")
+    
+    offline_events = []
+    
+    def on_offline(device_id):
+        print(f"[Callback] Device {device_id} went offline!")
+        offline_events.append(device_id)
+    
+    # 创建心跳检测器
+    detector = HeartbeatDetector(
+        heartbeat_interval=0.5,
+        timeout=0.2,
+        max_failures=2,
+        on_device_offline=on_offline
+    )
+    
+    # 注册设备
+    for i in range(4):
+        detector.register_device(f"Device_{i}")
+    
+    # 启动心跳检测
+    detector.start()
+    
+    print("Waiting for initial heartbeats...")
+    time.sleep(1)
+    detector.print_status()
+    
+    # 模拟设备1离线
+    print("\nSimulating Device_1 going offline...")
+    detector.simulate_device_offline("Device_1")
+    
+    # 等待检测到离线
+    time.sleep(2)
+    detector.print_status()
+    
+    print(f"\nOffline events detected: {offline_events}")
+    
+    # 停止检测
+    detector.stop()
+    print("Test completed.")

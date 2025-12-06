@@ -1,476 +1,832 @@
-[""]
-分布式推理系统执行优化算(Demo
-模拟多设备分布式推理场景，演示设备下线后的KV-Cache复用优化策略,
-使用真实的Llama-3.2-1B模型进行推理)
 """
-import threading
-import time
-import random
-from typing import Dict, List
-import sys
+分布式推理系统设备离线优化Demo (Distributed Inference Device Offline Optimization Demo)
+
+该Demo演示了在分布式张量并行推理系统中，当设备离线时的优化处理策略。
+
+主要功能：
+1. 模拟多设备分布式推理环境（使用多线程）
+2. Leader节点进行心跳检测和任务分配
+3. Worker节点持有各自分配的Heads和对应的KV-Cache
+4. 设备离线时，使用KV-Cache复用策略进行优化重计算
+5. 与传统全量重计算策略进行性能对比
+
+系统架构：
+- 1个Leader（同时也参与计算）
+- N-1个Workers
+- 使用心跳机制检测设备存活
+- 支持动态任务重分配
+
+使用方法：
+    python execution_optimization_algorithm_demo.py
+"""
+
 import os
+import sys
+import time
+import json
+import threading
+import queue
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import argparse
 
-# 导入自定义模块
-from heartbeat_detection import HeartbeatDetector
-from task_reassign import TaskReassigner
-from kv_cache_reused import KVCacheManager
-from llama_model_loader import LlamaModel
-from performance_comparator import PerformanceComparator
+import torch
+import torch.nn as nn
+import numpy as np
 
-
-class Worker:
-    """Worker节点"""
-    
-    def __init__(self, worker_id: str, assigned_heads: List[int], leader):
-        """
-        初始化Worker
-        
-        Args:
-            worker_id: Worker的唯一标识
-            assigned_heads: 分配给该Worker的头部列表
-            leader: Leader节点引用
-        """
-        self.worker_id = worker_id
-        self.assigned_heads = assigned_heads.copy()
-        self.leader = leader
-        self.is_running = True
-        self.heartbeat_thread = None
-        self.is_alive = True
-        
-    def start(self):
-        """启动Worker"""
-        self.is_running = True
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
-        print(f"[Worker-{self.worker_id}] 已启动，负责 Heads: {self.assigned_heads}")
-    
-    def _heartbeat_loop(self):
-        """心跳发送循环"""
-        while self.is_running and self.is_alive:
-            # 向Leader发送心跳
-            self.leader.receive_heartbeat(self.worker_id)
-            time.sleep(1.0)  # 每秒发送一次心跳
-    
-    def simulate_failure(self):
-        """模拟Worker失败（停止发送心跳）"""
-        print(f"[Worker-{self.worker_id}] 💥 模拟设备下线...")
-        self.is_alive = False
-        self.is_running = False
-    
-    def update_heads(self, new_heads: List[int]):
-        """更新Worker负责的头部"""
-        self.assigned_heads = new_heads.copy()
-        print(f"[Worker-{self.worker_id}] 更新任务，现在负责 Heads: {self.assigned_heads}")
-    
-    def stop(self):
-        """停止Worker"""
-        self.is_running = False
-        if self.heartbeat_thread:
-            self.heartbeat_thread.join(timeout=2.0)
+# 导入本地模块
+from task_reassign import TaskReassignManager, create_task_manager
+from heartbeat_detection import HeartbeatDetector, DeviceStatus
+from kv_cache_reused import KVCacheManager, KVCacheReuseEngine
+from performance_comparator import PerformanceComparator, ComparisonResult
 
 
-class Leader:
-    """Leader节点（同时也是Worker）"""
+class DeviceRole(Enum):
+    """设备角色"""
+    LEADER = "leader"
+    WORKER = "worker"
+
+
+@dataclass
+class DeviceConfig:
+    """设备配置"""
+    device_id: str
+    role: DeviceRole
+    assigned_heads: List[int] = field(default_factory=list)
+    is_online: bool = True
+
+
+@dataclass
+class InferenceTask:
+    """推理任务"""
+    task_id: str
+    input_ids: torch.Tensor
+    created_time: float = field(default_factory=time.time)
+
+
+class SimulatedDevice(threading.Thread):
+    """
+    模拟的设备节点
     
-    def __init__(self, leader_id: str, assigned_heads: List[int], 
-                 kv_cache_manager: KVCacheManager, task_reassigner: TaskReassigner,
-                 heartbeat_detector: HeartbeatDetector, performance_comparator: PerformanceComparator = None):
-        """
-        初始化Leader
-        
-        Args:
-            leader_id: Leader的唯一标识
-            assigned_heads: 分配给Leader的头部列表
-            kv_cache_manager: KV-Cache管理器
-            task_reassigner: 任务重分配器
-            heartbeat_detector: 心跳检测器
-            performance_comparator: 性能对比器
-        """
-        self.leader_id = leader_id
-        self.assigned_heads = assigned_heads.copy()
-        self.kv_cache_manager = kv_cache_manager
-        self.task_reassigner = task_reassigner
-        self.heartbeat_detector = heartbeat_detector
-        self.performance_comparator = performance_comparator or PerformanceComparator()
-        self.workers: Dict[str, Worker] = {}
-        self.lock = threading.Lock()
-        
-        # 设置失败回调
-        self.heartbeat_detector.set_failure_callback(self._handle_worker_failure)
+    每个设备运行在独立的线程中，模拟分布式环境。
+    """
     
-    def receive_heartbeat(self, worker_id: str):
-        """接收Worker的心跳"""
-        self.heartbeat_detector.receive_heartbeat(worker_id)
-    
-    def register_worker(self, worker: Worker):
-        """注册Worker"""
-        with self.lock:
-            self.workers[worker.worker_id] = worker
-            self.heartbeat_detector.register_worker(worker.worker_id)
-    
-    def _handle_worker_failure(self, failed_worker_id: str):
-        """处理Worker失败的回调"""
-        print(f"\n{'='*60}")
-        print(f"[Leader-{self.leader_id}] 🚨 检测到 Worker {failed_worker_id} 下线!")
-        print(f"{'='*60}\n")
+    def __init__(self, 
+                 device_id: str,
+                 role: DeviceRole,
+                 n_layers: int,
+                 n_kv_heads: int,
+                 head_dim: int,
+                 message_queue: queue.Queue,
+                 result_queue: queue.Queue):
+        super().__init__(name=f"Device-{device_id}")
         
-        # 获取所有存活的Worker（包括Leader自己）
-        alive_workers = [self.leader_id]
-        with self.lock:
-            for wid, worker in self.workers.items():
-                if self.heartbeat_detector.is_worker_alive(wid):
-                    alive_workers.append(wid)
+        self.device_id = device_id
+        self.role = role
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
         
-        print(f"[Leader-{self.leader_id}] 当前存活的节点: {alive_workers}")
+        # 通信队列
+        self.message_queue = message_queue  # 接收消息
+        self.result_queue = result_queue    # 发送结果
         
-        # 执行任务重分配
-        print(f"\n[Leader-{self.leader_id}] 开始执行任务重分配...")
-        new_assignments = self.task_reassigner.reassign_failed_worker(
-            failed_worker_id, alive_workers
+        # KV-Cache管理器
+        self.kv_manager = KVCacheManager(
+            device_id=device_id,
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim
         )
         
-        if not new_assignments:
-            print(f"[Leader-{self.leader_id}] 任务重分配失败或无需重分配")
-            return
+        # 控制标志
+        self.running = True
+        self.is_responsive = True  # 用于模拟离线
         
-        # 移除失败Worker的KV-Cache
-        self.kv_cache_manager.remove_worker_cache(failed_worker_id)
-        
-        # 执行KV-Cache复用和重计算（传入failed_worker_id用于对比）
-        print(f"\n[Leader-{self.leader_id}] 开始执行 KV-Cache 复用和重计算...")
-        self._perform_cache_reuse_and_recompute(failed_worker_id, new_assignments)
-        
-        print(f"\n{'='*60}")
-        print(f"[Leader-{self.leader_id}] ✅ 故障恢复完成!")
-        print(f"{'='*60}\n")
+        # 统计
+        self.tasks_completed = 0
+        self.computation_time = 0.0
     
-    def _perform_cache_reuse_and_recompute(self, failed_worker_id: str, new_assignments: Dict[str, List[int]]):
-        """执行KV-Cache复用和重计算（优化方法），并与传统方法对比"""
-        total_reused = 0
-        total_recomputed = 0
-        total_time = 0.0
-        
-        print(f"\n{'='*60}")
-        print("方法对比：KV-Cache复用 vs 完全重计算")
-        print(f"{'='*60}")
-        
-        # 1. 首先计算传统方法的耗时（完全重计算所有32个heads）
-        print(f"\n【传统方法】完全重计算所有KV-Cache（丢弃所有已有cache，重新计算32个heads）")
-        traditional_time = self._calculate_traditional_recompute_time(failed_worker_id)
-        
-        # 2. 执行我们的优化方法（KV-Cache复用）
-        print(f"\n【优化方法】KV-Cache复用 + 部分重计算")
-        
-        for worker_id, new_heads in new_assignments.items():
-            print(f"\n[处理 {worker_id}]")
-            
-            # 获取该Worker原有的头部
-            old_heads = self.task_reassigner.get_worker_heads(worker_id)
-            
-            # 执行复用和重计算
-            compute_time, reused_count, recomputed_count = \
-                self.kv_cache_manager.reuse_cache_and_compute_new(
-                    worker_id, old_heads, new_heads
-                )
-            
-            total_reused += reused_count
-            total_recomputed += recomputed_count
-            total_time += compute_time
-            
-            # 更新Worker的任务（如果是其他Worker）
-            with self.lock:
-                if worker_id in self.workers:
-                    updated_heads = self.task_reassigner.get_worker_heads(worker_id)
-                    self.workers[worker_id].update_heads(updated_heads)
-                elif worker_id == self.leader_id:
-                    # 更新Leader自己的任务
-                    self.assigned_heads = self.task_reassigner.get_worker_heads(worker_id)
-                    print(f"[Leader-{self.leader_id}] 更新自己的任务，现在负责 Heads: {self.assigned_heads}")
-        
-        # 打印对比统计信息
-        self._print_comparison_statistics(traditional_time, total_time, total_reused, total_recomputed)
-        
-        # 记录到性能对比器
-        self.performance_comparator.add_comparison(
-            scenario=f"设备下线恢复",
-            traditional_time=traditional_time,
-            optimized_time=total_time,
-            total_heads=total_reused + total_recomputed,
-            reused_heads=total_reused,
-            recomputed_heads=total_recomputed
-        )
+    def set_assigned_heads(self, heads: List[int]):
+        """设置分配的Heads"""
+        self.kv_manager.set_assigned_heads(heads)
     
-    def _calculate_traditional_recompute_time(self, failed_worker_id: str) -> float:
+    def add_heads(self, new_heads: List[int]):
+        """添加新的Heads"""
+        self.kv_manager.add_heads(new_heads)
+    
+    def go_offline(self):
+        """模拟设备离线"""
+        self.is_responsive = False
+        print(f"[{self.device_id}] Going OFFLINE")
+    
+    def go_online(self):
+        """恢复在线"""
+        self.is_responsive = True
+        print(f"[{self.device_id}] Back ONLINE")
+    
+    def compute_kv_cache(self, input_tensor: torch.Tensor, 
+                          head_ids: List[int] = None) -> float:
         """
-        计算传统方法（完全重计算）的真实耗时
-        传统方法：丢弃所有已有的KV-Cache，从头开始重新计算所有32个heads
+        计算KV-Cache
         
         Args:
-            failed_worker_id: 失败的Worker ID（用于日志）
+            input_tensor: 输入张量
+            head_ids: 要计算的heads，如果不指定则计算需要计算的heads
             
         Returns:
-            传统方法的真实总耗时（秒）
+            计算时间
         """
-        import time as time_module
+        if head_ids is None:
+            head_ids = self.kv_manager.get_heads_needing_computation()
         
-        print(f"  传统方法：丢弃所有KV-Cache，完全重新计算所有32个heads...")
+        if not head_ids:
+            return 0.0
         
-        # 传统方法需要重新计算所有32个heads（整个模型）
-        all_heads = list(range(1, 33))  # heads 1-32
+        start_time = time.time()
         
-        # 真实执行完全重计算
-        start_time = time_module.time()
-        actual_time = self.kv_cache_manager.compute_kv_cache_for_heads_no_print(
-            "traditional_full_recompute", all_heads, seq_length=32
-        )
+        batch_size, seq_len, dim = input_tensor.shape
         
-        print(f"  传统方法完成，实际耗时 {actual_time:.3f}秒（重新计算了32个heads）")
-        
-        return actual_time
-    
-    def _print_comparison_statistics(self, traditional_time: float, optimized_time: float, 
-                                    reused_count: int, recomputed_count: int):
-        """
-        打印对比统计信息
-        
-        Args:
-            traditional_time: 传统方法耗时
-            optimized_time: 优化方法耗时
-            reused_count: 复用的头部数量
-            recomputed_count: 重计算的头部数量
-        """
-        print(f"\n{'='*60}")
-        print("性能对比结果:")
-        print(f"{'='*60}")
-        
-        print(f"\n传统方法（完全重计算）:")
-        print(f"  重计算头部数量: {reused_count + recomputed_count} 个")
-        print(f"  总耗时: {traditional_time:.3f} 秒")
-        
-        print(f"\n优化方法（KV-Cache复用）:")
-        print(f"  ✓ 复用的头部数量: {reused_count} 个")
-        print(f"  ✗ 重新计算的头部数量: {recomputed_count} 个")
-        print(f"  总耗时: {optimized_time:.3f} 秒")
-        
-        if reused_count + recomputed_count > 0:
-            reuse_ratio = reused_count / (reused_count + recomputed_count) * 100
-            print(f"  复用率: {reuse_ratio:.1f}%")
-        
-        # 计算性能提升
-        if traditional_time > 0:
-            time_saved = traditional_time - optimized_time
-            speedup = traditional_time / optimized_time if optimized_time > 0 else float('inf')
-            improvement = (time_saved / traditional_time) * 100
+        # 模拟计算每层的KV
+        for layer_id in range(self.n_layers):
+            for head_id in head_ids:
+                # 模拟K和V的计算
+                k = torch.randn(batch_size, seq_len, self.head_dim)
+                v = torch.randn(batch_size, seq_len, self.head_dim)
+                
+                # 存储到缓存
+                self.kv_manager.set_cache(layer_id, head_id, k, v)
             
-            print(f"\n性能提升:")
-            print(f"  节省时间: {time_saved:.3f} 秒")
-            print(f"  加速比: {speedup:.2f}x")
-            print(f"  性能提升: {improvement:.1f}%")
+            # 模拟层间延迟
+            time.sleep(0.002)  # 2ms per layer
         
-        print(f"{'='*60}")
+        computation_time = time.time() - start_time
+        self.computation_time += computation_time
+        
+        return computation_time
+    
+    def respond_to_heartbeat(self) -> bool:
+        """响应心跳请求"""
+        return self.is_responsive
+    
+    def process_message(self, message: Dict) -> Optional[Dict]:
+        """处理接收到的消息"""
+        msg_type = message.get("type")
+        
+        if msg_type == "heartbeat":
+            if self.is_responsive:
+                return {"type": "heartbeat_ack", "device_id": self.device_id}
+            return None
+        
+        elif msg_type == "compute_kv":
+            if not self.is_responsive:
+                return None
+            
+            input_tensor = message.get("input_tensor")
+            head_ids = message.get("head_ids")
+            
+            comp_time = self.compute_kv_cache(input_tensor, head_ids)
+            self.tasks_completed += 1
+            
+            return {
+                "type": "compute_kv_done",
+                "device_id": self.device_id,
+                "heads_computed": head_ids if head_ids else self.kv_manager.get_assigned_heads(),
+                "computation_time": comp_time
+            }
+        
+        elif msg_type == "add_heads":
+            new_heads = message.get("heads", [])
+            self.add_heads(new_heads)
+            return {
+                "type": "add_heads_done",
+                "device_id": self.device_id,
+                "new_heads": new_heads
+            }
+        
+        elif msg_type == "get_status":
+            return {
+                "type": "status",
+                "device_id": self.device_id,
+                "assigned_heads": self.kv_manager.get_assigned_heads(),
+                "cached_heads": self.kv_manager.get_heads_with_cache(),
+                "needs_computation": self.kv_manager.get_heads_needing_computation(),
+                "is_responsive": self.is_responsive
+            }
+        
+        elif msg_type == "shutdown":
+            self.running = False
+            return {"type": "shutdown_ack", "device_id": self.device_id}
+        
+        return None
+    
+    def run(self):
+        """设备主循环"""
+        print(f"[{self.device_id}] Started as {self.role.value.upper()}")
+        
+        while self.running:
+            try:
+                # 非阻塞方式获取消息
+                message = self.message_queue.get(timeout=0.1)
+                
+                result = self.process_message(message)
+                
+                if result:
+                    self.result_queue.put(result)
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[{self.device_id}] Error: {e}")
+        
+        print(f"[{self.device_id}] Stopped")
 
 
 class DistributedInferenceSystem:
-    """分布式推理系统"""
+    """
+    分布式推理系统
     
-    def __init__(self, num_heads: int = 16, num_workers: int = 4, 
-                 model_path: str = None, use_real_model: bool = True):
+    协调多个模拟设备进行分布式推理，支持：
+    - 设备管理和任务分配
+    - 心跳检测和设备存活监控
+    - 设备离线处理和任务重分配
+    - KV-Cache复用优化
+    """
+    
+    def __init__(self,
+                 model_params_path: str,
+                 num_devices: int = 4,
+                 head_distribution: Dict[str, List[int]] = None):
         """
         初始化分布式推理系统
         
         Args:
-            num_heads: 总头部数量
-            num_workers: Worker数量（包括Leader）
-            model_path: 模型路径（如果使用真实模型）
-            use_real_model: 是否使用真实模型
+            model_params_path: 模型参数文件路径
+            num_devices: 设备数量
+            head_distribution: 可选的Head分配方案
         """
-        self.num_heads = num_heads
-        self.num_workers = num_workers
-        self.use_real_model = use_real_model
+        # 加载模型参数
+        with open(model_params_path, 'r') as f:
+            self.params = json.load(f)
         
-        # 加载真实模型（如果需要）
-        self.llama_model = None
-        if use_real_model and model_path:
-            params_path = os.path.join(os.path.dirname(model_path), "params.json")
-            self.llama_model = LlamaModel(model_path, params_path)
-            # 使用模型的实际head数量
-            self.num_heads = self.llama_model.get_num_heads()
-            print(f"[System] 使用真实模型，head数量: {self.num_heads}")
+        self.dim = self.params['dim']
+        self.n_layers = self.params['n_layers']
+        self.n_heads = self.params['n_heads']
+        self.n_kv_heads = self.params['n_kv_heads']
+        self.head_dim = self.dim // self.n_heads
         
-        # 初始化各个组件
-        self.kv_cache_manager = KVCacheManager(
-            llama_model=self.llama_model,
-            num_layers=self.llama_model.get_num_layers() if self.llama_model else 16,
-            hidden_size=self.llama_model.get_head_dim() if self.llama_model else 64
-        )
-        self.task_reassigner = TaskReassigner()
-        self.heartbeat_detector = HeartbeatDetector(check_interval=2.0, timeout=5.0)
-        self.performance_comparator = PerformanceComparator()
+        self.num_devices = num_devices
         
-        # 初始化任务分配
-        self.initial_assignments = self._create_initial_assignments()
-        self.task_reassigner.initialize_assignments(self.initial_assignments)
-        
-        # 创建Leader和Workers
-        leader_id = "Device-0"
-        self.leader = Leader(
-            leader_id,
-            self.initial_assignments[leader_id],
-            self.kv_cache_manager,
-            self.task_reassigner,
-            self.heartbeat_detector,
-            self.performance_comparator
+        # 创建任务管理器
+        device_ids = [f"Device_{i}" for i in range(num_devices)]
+        self.task_manager = TaskReassignManager(
+            total_heads=self.n_kv_heads,
+            device_ids=device_ids,
+            head_distribution=head_distribution
         )
         
-        # 初始化Leader的KV-Cache
-        self.kv_cache_manager.initialize_worker_cache(
-            leader_id, self.initial_assignments[leader_id]
-        )
+        # 创建设备
+        self.devices: Dict[str, SimulatedDevice] = {}
+        self.message_queues: Dict[str, queue.Queue] = {}
+        self.result_queue = queue.Queue()  # 共享的结果队列
         
-        # 创建其他Workers
-        self.workers: List[Worker] = []
-        for i in range(1, num_workers):
-            worker_id = f"Device-{i}"
-            worker = Worker(
-                worker_id,
-                self.initial_assignments[worker_id],
-                self.leader
-            )
-            self.workers.append(worker)
-            self.leader.register_worker(worker)
+        for i, device_id in enumerate(device_ids):
+            msg_queue = queue.Queue()
+            self.message_queues[device_id] = msg_queue
             
-            # 初始化Worker的KV-Cache
-            self.kv_cache_manager.initialize_worker_cache(
-                worker_id, self.initial_assignments[worker_id]
+            device = SimulatedDevice(
+                device_id=device_id,
+                role=DeviceRole.LEADER if i == 0 else DeviceRole.WORKER,
+                n_layers=self.n_layers,
+                n_kv_heads=self.n_kv_heads,
+                head_dim=self.head_dim,
+                message_queue=msg_queue,
+                result_queue=self.result_queue
             )
+            
+            # 设置初始分配的heads
+            assigned_heads = self.task_manager.get_device_heads(device_id)
+            device.set_assigned_heads(assigned_heads)
+            
+            self.devices[device_id] = device
+        
+        # 创建心跳检测器
+        self.heartbeat_detector = HeartbeatDetector(
+            heartbeat_interval=0.5,
+            timeout=0.2,
+            max_failures=2,
+            on_device_offline=self._on_device_offline
+        )
+        
+        # 注册设备到心跳检测
+        for device_id in device_ids[1:]:  # Leader不需要被检测
+            self.heartbeat_detector.register_device(device_id)
+        
+        # 创建性能对比器
+        self.comparator = PerformanceComparator(
+            n_kv_heads=self.n_kv_heads,
+            n_layers=self.n_layers,
+            head_dim=self.head_dim
+        )
+        
+        # 统计信息
+        self.offline_events: List[Dict] = []
+        self.reuse_results: List[Dict] = []
+        self.full_recompute_results: List[Dict] = []
+        
+        print(f"\n{'='*70}")
+        print("Distributed Inference System Initialized")
+        print(f"{'='*70}")
+        print(f"  Model Parameters:")
+        print(f"    - Dimensions: {self.dim}")
+        print(f"    - Layers: {self.n_layers}")
+        print(f"    - Attention Heads: {self.n_heads}")
+        print(f"    - KV Heads: {self.n_kv_heads}")
+        print(f"    - Head Dimension: {self.head_dim}")
+        print(f"  System Configuration:")
+        print(f"    - Number of Devices: {num_devices}")
+        print(f"    - Leader: Device_0")
+        print(f"{'='*70}\n")
     
-    def _create_initial_assignments(self) -> Dict[str, List[int]]:
-        """创建初始的头部分配"""
-        assignments = {}
-        heads_per_worker = self.num_heads // self.num_workers
-        remainder = self.num_heads % self.num_workers
+    def _on_device_offline(self, device_id: str):
+        """设备离线回调"""
+        print(f"\n[ALERT] Device {device_id} detected as OFFLINE!")
         
-        current_head = 1
-        for i in range(self.num_workers):
-            worker_id = f"Device-{i}"
-            # 前面的Worker多分配一个头（如果有余数）
-            num_heads_for_worker = heads_per_worker + (1 if i < remainder else 0)
-            assignments[worker_id] = list(range(current_head, current_head + num_heads_for_worker))
-            current_head += num_heads_for_worker
-        
-        return assignments
+        # 记录离线事件
+        self.offline_events.append({
+            "device_id": device_id,
+            "time": time.time(),
+            "assigned_heads": self.task_manager.get_device_heads(device_id)
+        })
     
     def start(self):
         """启动系统"""
-        print(f"\n{'='*60}")
-        print(f"分布式推理系统启动")
-        print(f"总头部数量: {self.num_heads}")
-        print(f"设备数量: {self.num_workers}")
-        print(f"{'='*60}\n")
+        print("[System] Starting all devices...")
+        
+        # 启动所有设备
+        for device in self.devices.values():
+            device.start()
         
         # 启动心跳检测
-        self.heartbeat_detector.start_detection()
+        self.heartbeat_detector.start()
         
-        # 启动所有Workers
-        for worker in self.workers:
-            worker.start()
-        
-        print(f"[Leader-{self.leader.leader_id}] 系统启动完成，负责 Heads: {self.leader.assigned_heads}\n")
-    
-    def simulate_worker_failure(self, worker_index: int, delay: float = 5.0):
-        """
-        模拟Worker失败
-        
-        Args:
-            worker_index: Worker索引（从1开始，0是Leader）
-            delay: 失败前的延迟时间（秒）
-        """
-        if worker_index < 1 or worker_index >= self.num_workers:
-            print(f"⚠️ Worker索引无效: {worker_index}")
-            return
-        
-        def delayed_failure():
-            time.sleep(delay)
-            self.workers[worker_index - 1].simulate_failure()
-        
-        failure_thread = threading.Thread(target=delayed_failure, daemon=True)
-        failure_thread.start()
+        print("[System] All devices started")
+        time.sleep(0.5)  # 等待设备初始化
     
     def stop(self):
         """停止系统"""
-        print(f"\n[System] 正在关闭系统...")
+        print("[System] Stopping all devices...")
         
         # 停止心跳检测
-        self.heartbeat_detector.stop_detection()
+        self.heartbeat_detector.stop()
         
-        # 停止所有Workers
-        for worker in self.workers:
-            worker.stop()
+        # 发送关闭命令
+        for device_id, msg_queue in self.message_queues.items():
+            msg_queue.put({"type": "shutdown"})
         
-        print(f"[System] 系统已关闭")
+        # 等待设备停止
+        for device in self.devices.values():
+            device.join(timeout=2.0)
+        
+        print("[System] All devices stopped")
     
-    def print_performance_report(self):
-        """打印性能对比报告"""
-        self.performance_comparator.print_report()
+    def send_message(self, device_id: str, message: Dict) -> Optional[Dict]:
+        """发送消息给设备并等待响应"""
+        if device_id not in self.message_queues:
+            return None
+        
+        self.message_queues[device_id].put(message)
+        
+        # 等待响应
+        try:
+            result = self.result_queue.get(timeout=5.0)
+            return result
+        except queue.Empty:
+            return None
     
-    def save_performance_report(self, filepath: str):
-        """保存性能对比报告"""
-        self.performance_comparator.save_report(filepath)
+    def broadcast_message(self, message: Dict) -> List[Dict]:
+        """广播消息给所有设备"""
+        for msg_queue in self.message_queues.values():
+            msg_queue.put(message.copy())
+        
+        results = []
+        expected = len(self.message_queues)
+        
+        while len(results) < expected:
+            try:
+                result = self.result_queue.get(timeout=5.0)
+                results.append(result)
+            except queue.Empty:
+                break
+        
+        return results
+    
+    def compute_initial_kv_cache(self, input_ids: torch.Tensor) -> Dict:
+        """
+        计算初始KV-Cache
+        
+        所有设备并行计算各自分配的heads的KV-Cache
+        """
+        print("\n[System] Computing initial KV-Cache for all devices...")
+        
+        # 创建输入张量
+        batch_size, seq_len = input_ids.shape
+        input_tensor = torch.randn(batch_size, seq_len, self.dim)
+        
+        results = {}
+        total_time = 0.0
+        total_heads = 0
+        
+        for device_id, device in self.devices.items():
+            if device.is_responsive:
+                assigned_heads = device.kv_manager.get_assigned_heads()
+                comp_time = device.compute_kv_cache(input_tensor, assigned_heads)
+                
+                results[device_id] = {
+                    "heads_computed": assigned_heads,
+                    "computation_time": comp_time
+                }
+                
+                total_time += comp_time
+                total_heads += len(assigned_heads)
+                
+                print(f"  {device_id}: computed {len(assigned_heads)} heads in {comp_time*1000:.2f}ms")
+        
+        print(f"\n[System] Initial KV-Cache computation complete")
+        print(f"  Total heads: {total_heads}")
+        print(f"  Total time: {total_time*1000:.2f}ms")
+        
+        return {
+            "per_device": results,
+            "total_time": total_time,
+            "total_heads": total_heads
+        }
+    
+    def simulate_device_offline(self, device_id: str):
+        """模拟设备离线"""
+        if device_id in self.devices:
+            self.devices[device_id].go_offline()
+            self.heartbeat_detector.simulate_device_offline(device_id)
+            self.task_manager.mark_device_offline(device_id)
+    
+    def handle_device_offline_with_reuse(self, 
+                                          offline_device_id: str,
+                                          input_ids: torch.Tensor) -> Dict:
+        """
+        使用KV-Cache复用策略处理设备离线
+        
+        Args:
+            offline_device_id: 离线设备ID
+            input_ids: 输入token IDs
+            
+        Returns:
+            处理结果
+        """
+        print(f"\n{'='*70}")
+        print(f"Handling Device Offline: {offline_device_id}")
+        print(f"Strategy: KV-Cache Reuse")
+        print(f"{'='*70}")
+        
+        start_time = time.time()
+        
+        # 1. 重新分配任务
+        target_device_id, reassigned_heads = self.task_manager.reassign_tasks(offline_device_id)
+        
+        print(f"\n[Task Reassignment]")
+        print(f"  Offline device: {offline_device_id}")
+        print(f"  Reassigned heads {reassigned_heads} to {target_device_id}")
+        
+        # 2. 更新目标设备的heads
+        if target_device_id in self.devices:
+            target_device = self.devices[target_device_id]
+            original_heads = target_device.kv_manager.get_assigned_heads()
+            cached_heads = target_device.kv_manager.get_heads_with_cache()
+            
+            target_device.add_heads(reassigned_heads)
+            
+            print(f"\n[{target_device_id}] Before reassignment:")
+            print(f"  Original heads: {original_heads}")
+            print(f"  Cached heads: {cached_heads}")
+            print(f"  After adding: {target_device.kv_manager.get_assigned_heads()}")
+        
+        # 3. 只计算新分配的heads（复用已有缓存）
+        batch_size, seq_len = input_ids.shape
+        input_tensor = torch.randn(batch_size, seq_len, self.dim)
+        
+        # 只计算新分配的heads
+        print(f"\n[KV-Cache Reuse] Only recomputing heads: {reassigned_heads}")
+        recompute_time = target_device.compute_kv_cache(input_tensor, reassigned_heads)
+        
+        total_time = time.time() - start_time
+        
+        # 统计
+        result = {
+            "strategy": "kv_cache_reuse",
+            "offline_device": offline_device_id,
+            "target_device": target_device_id,
+            "reassigned_heads": reassigned_heads,
+            "heads_reused": cached_heads,
+            "heads_recomputed": reassigned_heads,
+            "num_heads_reused": len(cached_heads),
+            "num_heads_recomputed": len(reassigned_heads),
+            "recompute_time": recompute_time,
+            "total_time": total_time
+        }
+        
+        self.reuse_results.append(result)
+        
+        print(f"\n[Result]")
+        print(f"  Heads reused: {len(cached_heads)}")
+        print(f"  Heads recomputed: {len(reassigned_heads)}")
+        print(f"  Recompute time: {recompute_time*1000:.2f}ms")
+        print(f"  Total time: {total_time*1000:.2f}ms")
+        
+        return result
+    
+    def handle_device_offline_full_recompute(self, 
+                                              offline_device_id: str,
+                                              input_ids: torch.Tensor) -> Dict:
+        """
+        使用传统全量重计算策略处理设备离线
+        
+        Args:
+            offline_device_id: 离线设备ID
+            input_ids: 输入token IDs
+            
+        Returns:
+            处理结果
+        """
+        print(f"\n{'='*70}")
+        print(f"Handling Device Offline: {offline_device_id}")
+        print(f"Strategy: Full Recompute (Traditional)")
+        print(f"{'='*70}")
+        
+        start_time = time.time()
+        
+        # 创建输入张量
+        batch_size, seq_len = input_ids.shape
+        input_tensor = torch.randn(batch_size, seq_len, self.dim)
+        
+        # 清除所有在线设备的缓存
+        print("\n[Full Recompute] Clearing all caches...")
+        for device_id, device in self.devices.items():
+            if device.is_responsive and device_id != offline_device_id:
+                device.kv_manager.clear_all_cache()
+        
+        # 重新计算所有heads
+        print("[Full Recompute] Recomputing all heads...")
+        total_compute_time = 0.0
+        total_heads = 0
+        
+        for device_id, device in self.devices.items():
+            if device.is_responsive and device_id != offline_device_id:
+                heads = device.kv_manager.get_assigned_heads()
+                comp_time = device.compute_kv_cache(input_tensor, heads)
+                
+                total_compute_time += comp_time
+                total_heads += len(heads)
+                
+                print(f"  {device_id}: recomputed {len(heads)} heads in {comp_time*1000:.2f}ms")
+        
+        total_time = time.time() - start_time
+        
+        result = {
+            "strategy": "full_recompute",
+            "offline_device": offline_device_id,
+            "total_heads_computed": total_heads,
+            "total_compute_time": total_compute_time,
+            "total_time": total_time
+        }
+        
+        self.full_recompute_results.append(result)
+        
+        print(f"\n[Result]")
+        print(f"  Total heads recomputed: {total_heads}")
+        print(f"  Total compute time: {total_compute_time*1000:.2f}ms")
+        print(f"  Total time: {total_time*1000:.2f}ms")
+        
+        return result
+    
+    def run_comparison_demo(self, input_ids: torch.Tensor) -> Dict:
+        """
+        运行对比Demo
+        
+        对比KV-Cache复用策略和全量重计算策略的性能
+        """
+        print("\n" + "#"*70)
+        print("# PERFORMANCE COMPARISON DEMO")
+        print("#"*70)
+        
+        # 首先计算初始KV-Cache
+        initial_result = self.compute_initial_kv_cache(input_ids)
+        
+        self.print_system_status()
+        
+        # 选择一个设备模拟离线
+        offline_device_id = "Device_1"  # 选择第一个worker
+        
+        # ============ 测试1: KV-Cache复用策略 ============
+        print("\n" + "="*70)
+        print("TEST 1: KV-Cache Reuse Strategy")
+        print("="*70)
+        
+        # 模拟设备离线
+        self.simulate_device_offline(offline_device_id)
+        time.sleep(0.5)  # 等待心跳检测
+        
+        # 使用复用策略处理
+        reuse_result = self.handle_device_offline_with_reuse(offline_device_id, input_ids)
+        
+        self.print_system_status()
+        
+        # 恢复状态用于对比测试
+        self._reset_for_comparison(offline_device_id, initial_result)
+        
+        # ============ 测试2: 全量重计算策略 ============
+        print("\n" + "="*70)
+        print("TEST 2: Full Recompute Strategy (Traditional)")
+        print("="*70)
+        
+        # 再次模拟设备离线
+        self.simulate_device_offline(offline_device_id)
+        
+        # 使用全量重计算策略处理
+        full_result = self.handle_device_offline_full_recompute(offline_device_id, input_ids)
+        
+        # ============ 性能对比 ============
+        comparison = self._compare_results(reuse_result, full_result)
+        
+        return comparison
+    
+    def _reset_for_comparison(self, offline_device_id: str, initial_result: Dict):
+        """重置系统状态以进行公平对比"""
+        print("\n[System] Resetting system state for comparison...")
+        
+        # 恢复离线设备
+        if offline_device_id in self.devices:
+            self.devices[offline_device_id].go_online()
+            self.heartbeat_detector.simulate_device_online(offline_device_id)
+            self.task_manager.mark_device_online(offline_device_id)
+        
+        # 重新初始化任务分配
+        device_ids = list(self.devices.keys())
+        self.task_manager = TaskReassignManager(
+            total_heads=self.n_kv_heads,
+            device_ids=device_ids
+        )
+        
+        # 重新设置每个设备的heads和缓存
+        for device_id, device in self.devices.items():
+            assigned_heads = self.task_manager.get_device_heads(device_id)
+            device.kv_manager = KVCacheManager(
+                device_id=device_id,
+                n_layers=self.n_layers,
+                n_kv_heads=self.n_kv_heads,
+                head_dim=self.head_dim
+            )
+            device.kv_manager.set_assigned_heads(assigned_heads)
+        
+        # 重新计算初始KV-Cache
+        batch_size = 1
+        seq_len = 64
+        input_tensor = torch.randn(batch_size, seq_len, self.dim)
+        
+        for device_id, device in self.devices.items():
+            if device.is_responsive:
+                assigned_heads = device.kv_manager.get_assigned_heads()
+                device.compute_kv_cache(input_tensor, assigned_heads)
+        
+        print("[System] Reset complete")
+    
+    def _compare_results(self, reuse_result: Dict, full_result: Dict) -> Dict:
+        """对比两种策略的结果"""
+        print("\n" + "="*70)
+        print("PERFORMANCE COMPARISON RESULTS")
+        print("="*70)
+        
+        reuse_time = reuse_result['total_time']
+        full_time = full_result['total_time']
+        
+        speedup = full_time / reuse_time if reuse_time > 0 else float('inf')
+        time_saved = full_time - reuse_time
+        time_saved_percent = (time_saved / full_time * 100) if full_time > 0 else 0
+        
+        heads_reused = reuse_result['num_heads_reused']
+        heads_recomputed = reuse_result['num_heads_recomputed']
+        total_heads_full = full_result['total_heads_computed']
+        
+        computation_saved = total_heads_full - heads_recomputed
+        computation_saved_percent = (computation_saved / total_heads_full * 100) if total_heads_full > 0 else 0
+        
+        print(f"\n{'Strategy':<30} {'Time (ms)':<15} {'Heads Computed':<20}")
+        print("-"*65)
+        print(f"{'KV-Cache Reuse':<30} {reuse_time*1000:<15.2f} {heads_recomputed:<20}")
+        print(f"{'Full Recompute':<30} {full_time*1000:<15.2f} {total_heads_full:<20}")
+        print("-"*65)
+        
+        print(f"\n{'Metric':<35} {'Value':<20}")
+        print("-"*55)
+        print(f"{'Speedup':<35} {speedup:.2f}x")
+        print(f"{'Time Saved':<35} {time_saved*1000:.2f}ms ({time_saved_percent:.1f}%)")
+        print(f"{'Heads Reused (Cache Hit)':<35} {heads_reused}")
+        print(f"{'Computation Saved':<35} {computation_saved} heads ({computation_saved_percent:.1f}%)")
+        print("-"*55)
+        
+        print(f"\n✓ KV-Cache Reuse strategy is {speedup:.2f}x faster than Full Recompute!")
+        print(f"✓ Saved {computation_saved_percent:.1f}% of computation by reusing cached values.")
+        print("="*70)
+        
+        return {
+            "reuse_result": reuse_result,
+            "full_result": full_result,
+            "speedup": speedup,
+            "time_saved_ms": time_saved * 1000,
+            "time_saved_percent": time_saved_percent,
+            "computation_saved_percent": computation_saved_percent
+        }
+    
+    def print_system_status(self):
+        """打印系统状态"""
+        print("\n" + "-"*70)
+        print("System Status")
+        print("-"*70)
+        
+        self.task_manager.print_status()
+        
+        print("Device KV-Cache Status:")
+        for device_id, device in self.devices.items():
+            status = "ONLINE" if device.is_responsive else "OFFLINE"
+            assigned = device.kv_manager.get_assigned_heads()
+            cached = device.kv_manager.get_heads_with_cache()
+            needs_comp = device.kv_manager.get_heads_needing_computation()
+            
+            print(f"  {device_id}: [{status}]")
+            print(f"    Assigned: {assigned}")
+            print(f"    Cached: {cached}")
+            print(f"    Needs Computation: {needs_comp}")
+        
+        print("-"*70 + "\n")
 
 
 def main():
     """主函数"""
-    print("\n" + "="*60)
-    print("分布式推理系统 - 设备离线优化Demo")
-    print("使用真实 Llama-3.2-1B 模型")
-    print("="*60 + "\n")
+    parser = argparse.ArgumentParser(description='Distributed Inference Device Offline Optimization Demo')
     
-    # 模型路径
-    model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/杂乱/Models/Llama-3.2-1B/model.safetensors"
+    parser.add_argument('--model-params', type=str,
+                        default='/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/杂乱/Models/Llama-3.2-1B/params.json',
+                        help='Path to model params.json')
+    parser.add_argument('--num-devices', type=int, default=4,
+                        help='Number of simulated devices')
+    parser.add_argument('--seq-length', type=int, default=64,
+                        help='Sequence length for test input')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size for test input')
     
-    # 创建系统：使用真实模型，4个设备
+    args = parser.parse_args()
+    
+    print("\n" + "="*70)
+    print("Distributed Inference Device Offline Optimization Demo")
+    print("="*70)
+    print(f"Model params: {args.model_params}")
+    print(f"Devices: {args.num_devices}")
+    print(f"Sequence length: {args.seq_length}")
+    print(f"Batch size: {args.batch_size}")
+    print("="*70 + "\n")
+    
+    # 创建测试输入
+    input_ids = torch.randint(0, 1000, (args.batch_size, args.seq_length))
+    
+    # 创建分布式推理系统
     system = DistributedInferenceSystem(
-        num_heads=32,  # Llama-3.2-1B有32个注意力头
-        num_workers=4,
-        model_path=model_path,
-        use_real_model=True
+        model_params_path=args.model_params,
+        num_devices=args.num_devices
     )
     
-    # 启动系统
-    system.start()
-    
-    # 让系统运行一段时间
-    print("[Demo] 系统正常运行中...\n")
-    time.sleep(3)
-    
-    # 模拟Device-1下线（5秒后）
-    print("[Demo] 将在5秒后模拟 Device-1 下线...\n")
-    system.simulate_worker_failure(worker_index=1, delay=5.0)
-    
-    # 等待故障检测和恢复完成
-    time.sleep(15)
-    
-    # 再次展示当前状态
-    print("\n" + "="*60)
-    print("最终状态:")
-    print("="*60)
-    current_assignments = system.task_reassigner.get_current_assignments()
-    for device_id, heads in current_assignments.items():
-        alive_status = "✓ 在线" if system.heartbeat_detector.is_worker_alive(device_id) or device_id == "Device-0" else "✗ 离线"
-        print(f"{device_id}: Heads {heads} - {alive_status}")
-    print("="*60 + "\n")
-    
-    # 停止系统
-    system.stop()
-    
-    # 生成并打印性能对比报告
-    system.print_performance_report()
-    
-    # 保存报告到文件
-    report_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/20251201-JSAC-Hy-DAC/Hy-DAC-Code/Hy-DAC/src/execute_optimization_algorithm/kv_cache_performance_report.txt"
-    system.save_performance_report(report_path)
-    
-    print("\n[Demo] Demo运行完成!\n")
+    try:
+        # 启动系统
+        system.start()
+        
+        # 运行对比Demo
+        comparison = system.run_comparison_demo(input_ids)
+        
+        # 等待一下让输出完整
+        time.sleep(0.5)
+        
+        print("\n" + "="*70)
+        print("Demo Completed Successfully!")
+        print("="*70)
+        print("\nKey Findings:")
+        print(f"  - KV-Cache Reuse Strategy achieved {comparison['speedup']:.2f}x speedup")
+        print(f"  - Saved {comparison['computation_saved_percent']:.1f}% of computation")
+        print(f"  - Time saved: {comparison['time_saved_ms']:.2f}ms")
+        print("\nThis demonstrates the effectiveness of the KV-Cache reuse optimization")
+        print("for handling device offline scenarios in distributed inference systems.")
+        print("="*70)
+        
+    finally:
+        # 停止系统
+        system.stop()
 
 
 if __name__ == "__main__":
