@@ -25,11 +25,11 @@ from llama_model import LlamaModelLoader, LlamaModel, LlamaConfig
 
 @dataclass
 class DeviceKVCache:
-    """设备的KV-Cache存储"""
+    """设备的KV-Cache存储（使用32个Attention Heads）"""
     device_id: str
     assigned_heads: List[int] = field(default_factory=list)
-    # {layer_id: {head_id: (k, v)}}
-    cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
+    # {layer_id: {head_id: (q, k, v)}}
+    cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     is_online: bool = True
     
     def has_cache_for_head(self, head_id: int, n_layers: int) -> bool:
@@ -54,11 +54,11 @@ class DeviceKVCache:
         return [h for h in self.assigned_heads 
                 if not self.has_cache_for_head(h, n_layers)]
     
-    def set_cache(self, layer_id: int, head_id: int, k: torch.Tensor, v: torch.Tensor):
-        """设置缓存"""
+    def set_cache(self, layer_id: int, head_id: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """设置缓存 (Q, K, V)"""
         if layer_id not in self.cache:
             self.cache[layer_id] = {}
-        self.cache[layer_id][head_id] = (k.clone(), v.clone())
+        self.cache[layer_id][head_id] = (q.clone(), k.clone(), v.clone())
     
     def clear_cache(self):
         """清除所有缓存"""
@@ -76,7 +76,7 @@ class RealModelKVCacheEngine:
     """
     真实模型 KV-Cache 引擎
     
-    使用真实的 Llama 模型计算 KV-Cache
+    使用真实的 Llama 模型计算 Q, K, V（使用全部 32 个 Attention Heads）
     """
     
     def __init__(self, 
@@ -105,31 +105,35 @@ class RealModelKVCacheEngine:
         # 设备管理
         self.devices: Dict[str, DeviceKVCache] = {}
         
-        print(f"\n[Engine] Model ready with {self.config.n_kv_heads} KV heads, "
-              f"{self.config.n_layers} layers")
+        # 使用 32 个 attention heads（而不是 8 个 KV heads）
+        self.n_attention_heads = self.config.n_heads  # 32
+        
+        print(f"\n[Engine] Model ready with {self.config.n_heads} attention heads, "
+              f"{self.config.n_kv_heads} KV heads, {self.config.n_layers} layers")
+        print(f"[Engine] Using ALL {self.n_attention_heads} attention heads for computation")
     
     def register_device(self, device_id: str, assigned_heads: List[int]):
-        """注册设备"""
+        """注册设备（分配 attention heads 0-31）"""
         self.devices[device_id] = DeviceKVCache(
             device_id=device_id,
             assigned_heads=sorted(assigned_heads),
             cache={},
             is_online=True
         )
-        print(f"[Engine] Registered {device_id} with heads {assigned_heads}")
+        print(f"[Engine] Registered {device_id} with attention heads {assigned_heads}")
     
-    def compute_kv_cache_for_device(self, 
-                                     tokens: torch.Tensor,
-                                     device_id: str,
-                                     head_ids: Optional[List[int]] = None,
-                                     force_recompute: bool = False) -> Tuple[float, int]:
+    def compute_qkv_cache_for_device(self, 
+                                      tokens: torch.Tensor,
+                                      device_id: str,
+                                      head_ids: Optional[List[int]] = None,
+                                      force_recompute: bool = False) -> Tuple[float, int]:
         """
-        使用真实模型为设备计算 KV-Cache
+        使用真实模型为设备计算 Q, K, V Cache（使用 32 个 attention heads）
         
         Args:
             tokens: 输入 token IDs [batch, seq_len]
             device_id: 设备ID
-            head_ids: 要计算的 head IDs，None 表示计算需要计算的
+            head_ids: 要计算的 attention head IDs (0-31)，None 表示计算需要计算的
             force_recompute: 是否强制重计算
             
         Returns:
@@ -152,19 +156,19 @@ class RealModelKVCacheEngine:
         if not heads_to_compute:
             return (0.0, 0)
         
-        # 使用真实模型计算 KV-Cache
+        # 使用真实模型计算 Q, K, V（使用 32 个 attention heads）
         tokens = tokens.to(self.device)
         
         start_time = time.time()
         
         with torch.no_grad():
-            # 使用模型计算所有层的 KV
-            all_kv = self.model.compute_all_kv(tokens, heads_to_compute)
+            # 使用模型计算所有层的 Q, K, V
+            all_qkv = self.model.compute_all_qkv_for_attention_heads(tokens, heads_to_compute)
             
             # 存储到设备缓存
-            for layer_id, layer_kv in all_kv.items():
-                for head_id, (k, v) in layer_kv.items():
-                    device_cache.set_cache(layer_id, head_id, k, v)
+            for layer_id, layer_qkv in all_qkv.items():
+                for head_id, (q, k, v) in layer_qkv.items():
+                    device_cache.set_cache(layer_id, head_id, q, k, v)
         
         computation_time = time.time() - start_time
         
@@ -173,12 +177,12 @@ class RealModelKVCacheEngine:
     def compute_all_devices(self, 
                             tokens: torch.Tensor,
                             force_recompute: bool = False) -> Dict[str, Tuple[float, int]]:
-        """计算所有设备的 KV-Cache"""
+        """计算所有设备的 Q, K, V Cache"""
         results = {}
         
         for device_id in self.devices:
             if self.devices[device_id].is_online:
-                time_taken, num_heads = self.compute_kv_cache_for_device(
+                time_taken, num_heads = self.compute_qkv_cache_for_device(
                     tokens, device_id, force_recompute=force_recompute
                 )
                 results[device_id] = (time_taken, num_heads)
@@ -228,27 +232,27 @@ class RealModelKVCacheEngine:
 
 
 def run_real_model_comparison():
-    """运行真实模型的性能对比"""
+    """运行真实模型的性能对比（使用全部32个Attention Heads）"""
     
     # 模型路径
     model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/杂乱/Models/Llama-3.2-1B/model.safetensors"
     params_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/边彦晖-学校/杂乱/Models/Llama-3.2-1B/params.json"
     
     print("\n" + "#"*70)
-    print("#" + " "*20 + "REAL MODEL DEMO" + " "*20 + "#")
+    print("#" + " "*15 + "REAL MODEL DEMO (32 Heads)" + " "*15 + "#")
     print("#" + " "*10 + "KV-Cache Reuse Optimization" + " "*10 + "#")
     print("#"*70)
     
     # 创建引擎
     engine = RealModelKVCacheEngine(model_path, params_path, device="cpu")
     
-    # 设置设备（4个设备，8个KV heads）
+    # 设置设备（4个设备，32个 Attention Heads）
     num_devices = 4
-    n_kv_heads = engine.config.n_kv_heads  # 8
-    heads_per_device = n_kv_heads // num_devices  # 2
+    n_attention_heads = engine.config.n_heads  # 32 (不是 8 个 KV heads)
+    heads_per_device = n_attention_heads // num_devices  # 8 heads per device
     
-    print(f"\n[Setup] {num_devices} devices, {n_kv_heads} KV heads")
-    print(f"[Setup] Each device handles {heads_per_device} heads")
+    print(f"\n[Setup] {num_devices} devices, {n_attention_heads} attention heads")
+    print(f"[Setup] Each device handles {heads_per_device} attention heads")
     
     for i in range(num_devices):
         device_id = f"Device_{i}"
@@ -263,20 +267,20 @@ def run_real_model_comparison():
     print(f"\n[Input] Sequence length: {seq_length}")
     
     # ============================================================
-    # 阶段1: 初始 KV-Cache 计算
+    # 阶段1: 初始 QKV-Cache 计算
     # ============================================================
     print("\n" + "="*60)
-    print("Phase 1: Initial KV-Cache Computation (All Devices)")
+    print("Phase 1: Initial QKV-Cache Computation (All 32 Heads)")
     print("="*60)
     
     initial_results = {}
     total_initial_time = 0.0
     
     for device_id in engine.devices:
-        time_taken, num_heads = engine.compute_kv_cache_for_device(tokens, device_id)
+        time_taken, num_heads = engine.compute_qkv_cache_for_device(tokens, device_id)
         initial_results[device_id] = (time_taken, num_heads)
         total_initial_time += time_taken
-        print(f"  {device_id}: computed {num_heads} heads in {time_taken*1000:.2f}ms")
+        print(f"  {device_id}: computed {num_heads} attention heads in {time_taken*1000:.2f}ms")
     
     print(f"\nTotal initial computation time: {total_initial_time*1000:.2f}ms")
     
@@ -295,13 +299,13 @@ def run_real_model_comparison():
     # 阶段2: 设备离线 - KV-Cache 复用策略
     # ============================================================
     print("\n" + "="*60)
-    print("Phase 2: Device Offline - KV-Cache REUSE Strategy")
+    print("Phase 2: Device Offline - QKV-Cache REUSE Strategy")
     print("="*60)
     
     offline_device = "Device_1"
     target_device = "Device_3"
     
-    print(f"\n[Scenario] {offline_device} goes offline")
+    print(f"\n[Scenario] {offline_device} goes offline (has {heads_per_device} attention heads)")
     print(f"[Action] Reassign its heads to {target_device}")
     
     # 记录 target 设备重分配前的状态
@@ -312,18 +316,18 @@ def run_real_model_comparison():
     reassigned_heads = engine.reassign_heads(offline_device, target_device)
     
     print(f"\n[Reassignment]")
-    print(f"  Reassigned heads: {reassigned_heads}")
-    print(f"  {target_device} original cached: {target_cached_before}")
-    print(f"  {target_device} now assigned: {engine.devices[target_device].assigned_heads}")
+    print(f"  Reassigned heads: {reassigned_heads} ({len(reassigned_heads)} heads)")
+    print(f"  {target_device} original cached: {target_cached_before} ({len(target_cached_before)} heads)")
+    print(f"  {target_device} now assigned: {engine.devices[target_device].assigned_heads} ({len(engine.devices[target_device].assigned_heads)} heads)")
     
     # 使用复用策略 - 只计算新分配的 heads
     reuse_start = time.time()
     
     heads_needing_compute = engine.devices[target_device].get_heads_needing_computation(engine.config.n_layers)
-    print(f"\n[KV-Cache Reuse] Only computing new heads: {heads_needing_compute}")
+    print(f"\n[QKV-Cache Reuse] Only computing new heads: {heads_needing_compute} ({len(heads_needing_compute)} heads)")
     
     if heads_needing_compute:
-        reuse_time, reuse_heads = engine.compute_kv_cache_for_device(
+        reuse_time, reuse_heads = engine.compute_qkv_cache_for_device(
             tokens, target_device, head_ids=heads_needing_compute
         )
     else:
@@ -331,7 +335,7 @@ def run_real_model_comparison():
     
     reuse_total_time = time.time() - reuse_start
     
-    print(f"\n[KV-Cache Reuse Result]")
+    print(f"\n[QKV-Cache Reuse Result]")
     print(f"  Heads reused (from cache): {len(target_cached_before)}")
     print(f"  Heads recomputed: {reuse_heads}")
     print(f"  Computation time: {reuse_time*1000:.2f}ms")
@@ -356,14 +360,14 @@ def run_real_model_comparison():
     
     # 重新计算初始缓存
     for device_id in engine.devices:
-        engine.compute_kv_cache_for_device(tokens, device_id)
+        engine.compute_qkv_cache_for_device(tokens, device_id)
     
     # 现在模拟相同的离线场景，但使用全量重计算
     engine.simulate_device_offline(offline_device)
     reassigned_heads = engine.reassign_heads(offline_device, target_device)
     
     print(f"\n[Scenario] {offline_device} goes offline (same as before)")
-    print(f"[Strategy] Full recompute - clear all caches and recompute everything")
+    print(f"[Strategy] Full recompute - clear all caches and recompute all {n_attention_heads} heads")
     
     # 全量重计算 - 清除所有在线设备的缓存
     full_start = time.time()
@@ -373,7 +377,7 @@ def run_real_model_comparison():
             device.clear_cache()
     
     print("\n[Full Recompute] Clearing all caches...")
-    print("[Full Recompute] Recomputing all heads for all online devices...")
+    print(f"[Full Recompute] Recomputing all {n_attention_heads} attention heads for all online devices...")
     
     full_results = {}
     full_compute_time = 0.0
@@ -381,18 +385,18 @@ def run_real_model_comparison():
     
     for device_id, device in engine.devices.items():
         if device.is_online:
-            time_taken, num_heads = engine.compute_kv_cache_for_device(
+            time_taken, num_heads = engine.compute_qkv_cache_for_device(
                 tokens, device_id, force_recompute=True
             )
             full_results[device_id] = (time_taken, num_heads)
             full_compute_time += time_taken
             total_heads_computed += num_heads
-            print(f"  {device_id}: recomputed {num_heads} heads in {time_taken*1000:.2f}ms")
+            print(f"  {device_id}: recomputed {num_heads} attention heads in {time_taken*1000:.2f}ms")
     
     full_total_time = time.time() - full_start
     
     print(f"\n[Full Recompute Result]")
-    print(f"  Total heads recomputed: {total_heads_computed}")
+    print(f"  Total attention heads recomputed: {total_heads_computed}")
     print(f"  Total computation time: {full_compute_time*1000:.2f}ms")
     print(f"  Total time: {full_total_time*1000:.2f}ms")
     
@@ -400,7 +404,7 @@ def run_real_model_comparison():
     # 阶段4: 性能对比
     # ============================================================
     print("\n" + "="*70)
-    print("PERFORMANCE COMPARISON RESULTS (Real Model)")
+    print("PERFORMANCE COMPARISON RESULTS (Real Model - 32 Attention Heads)")
     print("="*70)
     
     speedup = full_total_time / reuse_total_time if reuse_total_time > 0 else float('inf')
@@ -412,7 +416,7 @@ def run_real_model_comparison():
     
     print(f"\n{'Strategy':<35} {'Time (ms)':<15} {'Heads Computed':<20}")
     print("-"*70)
-    print(f"{'KV-Cache Reuse (Optimized)':<35} {reuse_total_time*1000:<15.2f} {reuse_heads:<20}")
+    print(f"{'QKV-Cache Reuse (Optimized)':<35} {reuse_total_time*1000:<15.2f} {reuse_heads:<20}")
     print(f"{'Full Recompute (Traditional)':<35} {full_total_time*1000:<15.2f} {total_heads_computed:<20}")
     print("-"*70)
     
@@ -425,9 +429,9 @@ def run_real_model_comparison():
     print("-"*65)
     
     print(f"\n{'='*70}")
-    print(f"✅ KV-Cache Reuse strategy is {speedup:.2f}x FASTER than Full Recompute!")
-    print(f"✅ Saved {heads_saved_percent:.1f}% of computation by reusing cached KV values.")
-    print(f"✅ This is REAL MODEL computation, not simulation!")
+    print(f"✅ QKV-Cache Reuse strategy is {speedup:.2f}x FASTER than Full Recompute!")
+    print(f"✅ Saved {heads_saved_percent:.1f}% of computation by reusing cached QKV values.")
+    print(f"✅ This is REAL MODEL computation with ALL 32 attention heads!")
     print(f"{'='*70}")
     
     # 返回结果
@@ -436,14 +440,16 @@ def run_real_model_comparison():
         "full_time_ms": full_total_time * 1000,
         "speedup": speedup,
         "time_saved_percent": time_saved_percent,
-        "heads_saved_percent": heads_saved_percent
+        "heads_saved_percent": heads_saved_percent,
+        "n_attention_heads": n_attention_heads,
+        "heads_per_device": heads_per_device
     }
 
 
 if __name__ == "__main__":
     print("\n" + "="*70)
     print("Real Model Distributed Inference Optimization Demo")
-    print("Using Llama-3.2-1B for actual KV-Cache computation")
+    print("Using Llama-3.2-1B with ALL 32 Attention Heads")
     print("="*70)
     
     try:
@@ -452,7 +458,8 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         print("Demo Completed Successfully!")
         print("="*70)
-        print("\nKey Findings (Real Model):")
+        print(f"\nKey Findings (Real Model - {results['n_attention_heads']} Attention Heads):")
+        print(f"  - Heads per device: {results['heads_per_device']}")
         print(f"  - Speedup: {results['speedup']:.2f}x")
         print(f"  - Time saved: {results['time_saved_percent']:.1f}%")
         print(f"  - Computation saved: {results['heads_saved_percent']:.1f}%")

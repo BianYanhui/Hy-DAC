@@ -52,6 +52,7 @@ class PerformanceVisualizer:
     性能可视化器
     
     生成设备离线优化策略的对比图表
+    使用全部 32 个 attention heads 进行计算
     """
     
     def __init__(self, 
@@ -76,13 +77,15 @@ class PerformanceVisualizer:
                 params = json.load(f)
             self.n_layers = params.get('n_layers', 16)
             self.n_kv_heads = params.get('n_kv_heads', 8)
+            self.n_heads = params.get('n_heads', 32)  # 使用全部 32 个 attention heads
             self.dim = params.get('dim', 2048)
         else:
             self.n_layers = 16
             self.n_kv_heads = 8
+            self.n_heads = 32  # 使用全部 32 个 attention heads
             self.dim = 2048
         
-        self.head_dim = self.dim // 32  # 假设32个attention heads
+        self.head_dim = self.dim // self.n_heads  # 64
         
         # 如果使用真实模型，加载它
         self.model = None
@@ -104,10 +107,10 @@ class PerformanceVisualizer:
     
     def simulate_inference_step(self, num_heads: int, seq_length: int = 64) -> float:
         """
-        模拟一次推理步骤
+        模拟一次推理步骤（使用全部 32 个 attention heads）
         
         Args:
-            num_heads: 参与计算的head数量
+            num_heads: 参与计算的 attention head 数量 (0-32)
             seq_length: 序列长度
             
         Returns:
@@ -116,7 +119,7 @@ class PerformanceVisualizer:
         start_time = time.time()
         
         if self.model is not None and self.use_real_model:
-            # 使用真实模型计算
+            # 使用真实模型计算 Q, K, V（32 个 attention heads）
             tokens = torch.randint(0, 1000, (1, seq_length))
             with torch.no_grad():
                 x = self.model.tok_embeddings(tokens)
@@ -124,21 +127,23 @@ class PerformanceVisualizer:
                 
                 h = x
                 for layer in self.model.layers:
-                    # 计算指定数量的heads
-                    head_ids = list(range(min(num_heads, self.n_kv_heads)))
-                    _ = layer.compute_kv(h, freqs_cis, head_ids)
+                    # 计算指定数量的 attention heads (0-31)
+                    head_ids = list(range(min(num_heads, self.n_heads)))
+                    _ = layer.compute_qkv_for_attention_heads(h, freqs_cis, head_ids)
                     
                     # 简化的前向传播
                     h = h + layer.feed_forward(layer.ffn_norm(h))
         else:
-            # 模拟计算
+            # 模拟计算（32 个 attention heads）
             batch_size = 1
             for layer in range(self.n_layers):
                 for head in range(num_heads):
+                    # 模拟 Q, K, V 计算
+                    q = torch.randn(batch_size, seq_length, self.head_dim)
                     k = torch.randn(batch_size, seq_length, self.head_dim)
                     v = torch.randn(batch_size, seq_length, self.head_dim)
-                    _ = torch.matmul(k, k.transpose(-2, -1))
-                    _ = torch.matmul(v, v.transpose(-2, -1))
+                    _ = torch.matmul(q, k.transpose(-2, -1))
+                    _ = torch.matmul(q, v.transpose(-2, -1))
         
         return (time.time() - start_time) * 1000
     
@@ -182,7 +187,7 @@ class PerformanceVisualizer:
                                         num_devices: int = 4,
                                         seq_length: int = 64) -> Tuple[List[InferenceTimePoint], List[InferenceTimePoint]]:
         """
-        生成推理时间序列数据
+        生成推理时间序列数据（使用全部 32 个 attention heads）
         
         Args:
             total_steps: 总推理步数
@@ -193,8 +198,9 @@ class PerformanceVisualizer:
         Returns:
             (kv_cache_reuse_series, full_recompute_series): 两种策略的时间序列
         """
-        heads_per_device = self.n_kv_heads // num_devices
-        offline_device_heads = heads_per_device  # 离线设备的head数量
+        # 使用 32 个 attention heads
+        heads_per_device = self.n_heads // num_devices  # 32 / 4 = 8 heads per device
+        offline_device_heads = heads_per_device  # 离线设备的 attention head 数量
         
         kv_cache_series = []
         full_recompute_series = []
@@ -202,35 +208,36 @@ class PerformanceVisualizer:
         print(f"\n[Visualizer] Generating inference time series...")
         print(f"  Total steps: {total_steps}")
         print(f"  Device offline at step: {offline_step}")
+        print(f"  Total attention heads: {self.n_heads}")
         print(f"  Heads per device: {heads_per_device}")
         
         # 预热
         for _ in range(3):
-            self.simulate_inference_step(self.n_kv_heads, seq_length)
+            self.simulate_inference_step(self.n_heads, seq_length)
         
         for step in range(total_steps):
             event = ""
             
             if step < offline_step:
                 # 正常推理阶段
-                # 所有设备正常工作，每个设备计算自己的heads
-                kv_time = self.simulate_inference_step(self.n_kv_heads, seq_length)
+                # 所有设备正常工作，每个设备计算自己的 attention heads
+                kv_time = self.simulate_inference_step(self.n_heads, seq_length)
                 full_time = kv_time  # 正常情况下两种策略相同
                 
             elif step == offline_step:
                 # 设备离线时刻
                 event = "device_offline"
                 
-                # KV-Cache 复用策略：只需要重新计算离线设备的heads
+                # QKV-Cache 复用策略：只需要重新计算离线设备的 attention heads
                 # 其他设备的缓存可以复用
                 kv_recompute_heads = offline_device_heads
-                kv_time = self.simulate_inference_step(self.n_kv_heads, seq_length)
-                # 额外的重计算时间（只计算离线设备的heads）
+                kv_time = self.simulate_inference_step(self.n_heads, seq_length)
+                # 额外的重计算时间（只计算离线设备的 attention heads）
                 kv_time += self.simulate_inference_step(kv_recompute_heads, seq_length) * 0.5
                 
-                # 全量重计算策略：需要重新计算所有heads
-                full_recompute_heads = self.n_kv_heads
-                full_time = self.simulate_inference_step(self.n_kv_heads, seq_length)
+                # 全量重计算策略：需要重新计算所有 32 个 attention heads
+                full_recompute_heads = self.n_heads
+                full_time = self.simulate_inference_step(self.n_heads, seq_length)
                 # 额外的全量重计算时间
                 full_time += self.simulate_inference_step(full_recompute_heads, seq_length) * 1.5
                 
@@ -239,13 +246,13 @@ class PerformanceVisualizer:
                 recovery_factor_kv = 1.0 + (0.3 * (offline_step + 3 - step) / 3)
                 recovery_factor_full = 1.0 + (0.8 * (offline_step + 3 - step) / 3)
                 
-                base_time = self.simulate_inference_step(self.n_kv_heads, seq_length)
+                base_time = self.simulate_inference_step(self.n_heads, seq_length)
                 kv_time = base_time * recovery_factor_kv
                 full_time = base_time * recovery_factor_full
                 
             else:
                 # 恢复后的稳定阶段
-                kv_time = self.simulate_inference_step(self.n_kv_heads, seq_length)
+                kv_time = self.simulate_inference_step(self.n_heads, seq_length)
                 full_time = kv_time
             
             # 添加一些随机噪声使数据更真实
@@ -256,20 +263,20 @@ class PerformanceVisualizer:
             full_recompute_series.append(InferenceTimePoint(step=step, time_ms=max(0, full_time), event=event))
             
             if step % 10 == 0:
-                print(f"  Step {step}: KV-Cache={kv_time:.2f}ms, Full={full_time:.2f}ms")
+                print(f"  Step {step}: QKV-Cache={kv_time:.2f}ms, Full={full_time:.2f}ms")
         
         return kv_cache_series, full_recompute_series
     
     def generate_breakdown_data(self,
-                                 num_heads_offline: int = 2,
+                                 num_heads_offline: int = 8,
                                  seq_length: int = 64,
                                  heartbeat_interval: float = 0.1,
                                  max_failures: int = 2) -> Tuple[OfflineRecoveryBreakdown, OfflineRecoveryBreakdown]:
         """
-        生成耗时分解数据
+        生成耗时分解数据（使用 32 个 attention heads）
         
         Args:
-            num_heads_offline: 离线设备的head数量
+            num_heads_offline: 离线设备的 attention head 数量 (默认 8，即 32/4 设备)
             seq_length: 序列长度
             heartbeat_interval: 心跳间隔
             max_failures: 最大失败次数
@@ -278,8 +285,8 @@ class PerformanceVisualizer:
             (kv_cache_breakdown, full_recompute_breakdown)
         """
         print(f"\n[Visualizer] Generating breakdown data...")
-        print(f"  Offline device heads: {num_heads_offline}")
-        print(f"  Total KV heads: {self.n_kv_heads}")
+        print(f"  Offline device attention heads: {num_heads_offline}")
+        print(f"  Total attention heads: {self.n_heads}")
         
         # 心跳检测时间（两种策略相同）
         heartbeat_time = self.simulate_heartbeat_detection(heartbeat_interval, max_failures)
@@ -287,26 +294,26 @@ class PerformanceVisualizer:
         # 任务重分配时间（两种策略相同）
         reassignment_time = self.simulate_task_reassignment(num_heads_offline)
         
-        # 首先测量单个head的计算时间基准
-        # 通过测量全量heads的时间来计算单个head的平均时间
+        # 首先测量单个 attention head 的计算时间基准
+        # 通过测量全量 heads 的时间来计算单个 head 的平均时间
         total_heads_time = 0
         for _ in range(3):
-            total_heads_time += self.simulate_inference_step(self.n_kv_heads, seq_length)
+            total_heads_time += self.simulate_inference_step(self.n_heads, seq_length)
         total_heads_time /= 3
         
-        # 计算单个head的平均时间
-        time_per_head = total_heads_time / self.n_kv_heads
+        # 计算单个 attention head 的平均时间
+        time_per_head = total_heads_time / self.n_heads
         
-        # KV-Cache 复用策略的重计算时间
-        # 只需要重新计算离线设备的heads（其他设备的KV-Cache可以复用）
+        # QKV-Cache 复用策略的重计算时间
+        # 只需要重新计算离线设备的 attention heads（其他设备的缓存可以复用）
         kv_recompute_time = time_per_head * num_heads_offline
         
         # 全量重计算策略的重计算时间
-        # 需要清除所有缓存，重新计算所有heads
+        # 需要清除所有缓存，重新计算所有 32 个 attention heads
         full_recompute_time = total_heads_time
         
         kv_breakdown = OfflineRecoveryBreakdown(
-            strategy_name="KV-Cache Reuse",
+            strategy_name="QKV-Cache Reuse",
             heartbeat_detection_ms=heartbeat_time,
             task_reassignment_ms=reassignment_time,
             recomputation_ms=kv_recompute_time,
@@ -325,11 +332,11 @@ class PerformanceVisualizer:
         recompute_saved = full_recompute_time - kv_recompute_time
         recompute_saved_percent = (recompute_saved / full_recompute_time) * 100
         
-        print(f"  Time per head: {time_per_head:.2f}ms")
-        print(f"  KV-Cache Reuse: heartbeat={heartbeat_time:.2f}ms, "
+        print(f"  Time per attention head: {time_per_head:.2f}ms")
+        print(f"  QKV-Cache Reuse: heartbeat={heartbeat_time:.2f}ms, "
               f"reassign={reassignment_time:.2f}ms, recompute={kv_recompute_time:.2f}ms (only {num_heads_offline} heads)")
         print(f"  Full Recompute: heartbeat={heartbeat_time:.2f}ms, "
-              f"reassign={reassignment_time:.2f}ms, recompute={full_recompute_time:.2f}ms (all {self.n_kv_heads} heads)")
+              f"reassign={reassignment_time:.2f}ms, recompute={full_recompute_time:.2f}ms (all {self.n_heads} heads)")
         print(f"  Recomputation time saved: {recompute_saved:.2f}ms ({recompute_saved_percent:.1f}%)")
         
         return kv_breakdown, full_breakdown
@@ -344,7 +351,7 @@ class PerformanceVisualizer:
         
         图1: 设备下线前后的推理时间对比
         """
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(14, 7))
         
         steps = [p.step for p in kv_series]
         kv_times = [p.time_ms for p in kv_series]
@@ -358,36 +365,53 @@ class PerformanceVisualizer:
                 break
         
         # 绘制时间序列
-        ax.plot(steps, kv_times, 'g-', linewidth=2, label='KV-Cache Reuse Strategy', marker='o', markersize=4)
-        ax.plot(steps, full_times, 'r-', linewidth=2, label='Full Recompute Strategy', marker='s', markersize=4)
+        ax.plot(steps, kv_times, 'g-', linewidth=2.5, label='QKV-Cache Reuse Strategy', marker='o', markersize=5)
+        ax.plot(steps, full_times, 'r-', linewidth=2.5, label='Full Recompute Strategy', marker='s', markersize=5)
         
         # 标记离线事件
         if offline_step is not None:
             ax.axvline(x=offline_step, color='orange', linestyle='--', linewidth=2, label='Device Offline Event')
             
-            # 添加注释
+            # 获取离线时刻的时间值
+            kv_at_offline = kv_times[offline_step]
+            full_at_offline = full_times[offline_step]
             max_time = max(max(kv_times), max(full_times))
-            ax.annotate('Device Offline', 
-                       xy=(offline_step, max_time * 0.9),
-                       xytext=(offline_step + 3, max_time * 0.95),
-                       fontsize=10,
-                       arrowprops=dict(arrowstyle='->', color='orange'),
-                       color='orange')
+            
+            # 在离线时刻添加数据标注
+            ax.annotate(f'{kv_at_offline:.1f}ms', 
+                       xy=(offline_step, kv_at_offline),
+                       xytext=(offline_step - 5, kv_at_offline + 30),
+                       fontsize=10, color='green', fontweight='bold',
+                       arrowprops=dict(arrowstyle='->', color='green', lw=1.5))
+            
+            ax.annotate(f'{full_at_offline:.1f}ms', 
+                       xy=(offline_step, full_at_offline),
+                       xytext=(offline_step + 3, full_at_offline + 30),
+                       fontsize=10, color='red', fontweight='bold',
+                       arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
+            
+            # 添加差异说明
+            diff_ms = full_at_offline - kv_at_offline
+            speedup = full_at_offline / kv_at_offline if kv_at_offline > 0 else 0
+            ax.text(offline_step + 1, (kv_at_offline + full_at_offline) / 2,
+                   f'Δ = {diff_ms:.1f}ms\n({speedup:.2f}x)',
+                   fontsize=9, color='purple', fontweight='bold',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         # 添加区域标注
         if offline_step is not None:
             ax.axvspan(0, offline_step, alpha=0.1, color='green', label='Normal Operation')
-            ax.axvspan(offline_step, offline_step + 4, alpha=0.1, color='red', label='Recovery Phase')
+            ax.axvspan(offline_step, offline_step + 4, alpha=0.15, color='red', label='Recovery Phase')
             ax.axvspan(offline_step + 4, max(steps), alpha=0.1, color='blue', label='Stable After Recovery')
         
         ax.set_xlabel('Inference Step', fontsize=12)
         ax.set_ylabel('Inference Time (ms)', fontsize=12)
-        ax.set_title('Inference Time Comparison: Before and After Device Offline', fontsize=14)
+        ax.set_title('Inference Time Comparison: Before and After Device Offline (32 Attention Heads)', fontsize=14)
         ax.legend(loc='upper right', fontsize=10)
         ax.grid(True, alpha=0.3)
         
-        # 设置y轴从0开始
-        ax.set_ylim(bottom=0)
+        # 设置y轴从0开始，并留出一些空间显示标注
+        ax.set_ylim(bottom=0, top=max(max(kv_times), max(full_times)) * 1.15)
         
         plt.tight_layout()
         
@@ -475,7 +499,7 @@ class PerformanceVisualizer:
                            save_dir: str = None,
                            show: bool = True):
         """
-        生成所有对比图表
+        生成所有对比图表（使用全部 32 个 attention heads）
         
         Args:
             total_steps: 总推理步数
@@ -486,7 +510,7 @@ class PerformanceVisualizer:
             show: 是否显示图表
         """
         print("\n" + "="*70)
-        print("Generating Performance Comparison Plots")
+        print("Generating Performance Comparison Plots (32 Attention Heads)")
         print("="*70)
         
         # 生成时间序列数据
@@ -497,8 +521,8 @@ class PerformanceVisualizer:
             seq_length=seq_length
         )
         
-        # 生成耗时分解数据
-        heads_per_device = self.n_kv_heads // num_devices
+        # 生成耗时分解数据（使用 32 个 attention heads）
+        heads_per_device = self.n_heads // num_devices  # 32 / 4 = 8 heads per device
         kv_breakdown, full_breakdown = self.generate_breakdown_data(
             num_heads_offline=heads_per_device,
             seq_length=seq_length

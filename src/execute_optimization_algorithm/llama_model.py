@@ -113,7 +113,7 @@ class LlamaAttention(nn.Module):
                    freqs_cis: torch.Tensor,
                    head_ids: Optional[List[int]] = None) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        计算指定 Heads 的 KV 值
+        计算指定 KV Heads 的 KV 值
         
         Args:
             x: 输入张量 [batch, seq_len, dim]
@@ -149,6 +149,58 @@ class LlamaAttention(nn.Module):
                 result[head_id] = (
                     k[:, :, head_id, :].clone(),  # [batch, seq_len, head_dim]
                     v[:, :, head_id, :].clone()
+                )
+        
+        return result
+    
+    def compute_qkv_for_attention_heads(self, x: torch.Tensor, 
+                                         freqs_cis: torch.Tensor,
+                                         attention_head_ids: Optional[List[int]] = None) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        计算指定 Attention Heads 的 Q, K, V 值
+        
+        使用全部 32 个 attention heads 进行计算，而不是 8 个 KV heads。
+        在 GQA 架构中，每 4 个 Q heads 共享 1 个 KV head，但这里我们按 attention head 粒度来计算和缓存。
+        
+        Args:
+            x: 输入张量 [batch, seq_len, dim]
+            freqs_cis: 位置编码频率
+            attention_head_ids: 要计算的 Attention Head IDs (0-31)，None 表示计算所有
+            
+        Returns:
+            {attention_head_id: (q, k, v)} 其中形状均为 [batch, seq_len, head_dim]
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # 计算所有 Q, K, V
+        q = self.wq(x)  # [batch, seq_len, n_heads * head_dim]
+        k = self.wk(x)  # [batch, seq_len, n_kv_heads * head_dim]
+        v = self.wv(x)  # [batch, seq_len, n_kv_heads * head_dim]
+        
+        # 重塑
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        
+        # 应用旋转位置编码
+        q, k = apply_rotary_emb(q, k, freqs_cis[:seq_len])
+        
+        # 扩展 K, V 以匹配 Q heads 数量 (GQA: 8 KV heads -> 32 Q heads)
+        # 每个 KV head 被 n_rep (4) 个 Q heads 共享
+        k_expanded = repeat_kv(k, self.n_rep)  # [batch, seq_len, n_heads, head_dim]
+        v_expanded = repeat_kv(v, self.n_rep)  # [batch, seq_len, n_heads, head_dim]
+        
+        # 提取指定的 attention heads
+        if attention_head_ids is None:
+            attention_head_ids = list(range(self.n_heads))
+        
+        result = {}
+        for head_id in attention_head_ids:
+            if 0 <= head_id < self.n_heads:
+                result[head_id] = (
+                    q[:, :, head_id, :].clone(),
+                    k_expanded[:, :, head_id, :].clone(),
+                    v_expanded[:, :, head_id, :].clone()
                 )
         
         return result
@@ -246,9 +298,16 @@ class LlamaTransformerBlock(nn.Module):
     def compute_kv(self, x: torch.Tensor, 
                    freqs_cis: torch.Tensor,
                    head_ids: Optional[List[int]] = None) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
-        """计算该层指定 Heads 的 KV 值"""
+        """计算该层指定 KV Heads 的 KV 值"""
         h = self.attention_norm(x)
         return self.attention.compute_kv(h, freqs_cis, head_ids)
+    
+    def compute_qkv_for_attention_heads(self, x: torch.Tensor,
+                                         freqs_cis: torch.Tensor,
+                                         attention_head_ids: Optional[List[int]] = None) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """计算该层指定 Attention Heads (0-31) 的 Q, K, V 值"""
+        h = self.attention_norm(x)
+        return self.attention.compute_qkv_for_attention_heads(h, freqs_cis, attention_head_ids)
     
     def forward_with_cache(self, x: torch.Tensor,
                            freqs_cis: torch.Tensor,
@@ -317,11 +376,11 @@ class LlamaModel(nn.Module):
     def compute_all_kv(self, tokens: torch.Tensor,
                        head_ids: Optional[List[int]] = None) -> Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
         """
-        计算所有层指定 Heads 的 KV 值
+        计算所有层指定 KV Heads 的 KV 值
         
         Args:
             tokens: 输入 token IDs [batch, seq_len]
-            head_ids: 要计算的 Head IDs
+            head_ids: 要计算的 KV Head IDs (0-7)
             
         Returns:
             {layer_id: {head_id: (k, v)}}
@@ -347,6 +406,45 @@ class LlamaModel(nn.Module):
             attn_out = layer.attention.forward_with_cache(h_normed, freqs_cis, full_kv)
             h = h + attn_out
             h = h + layer.feed_forward(layer.ffn_norm(h))
+        
+        return all_kv
+    
+    def compute_all_qkv_for_attention_heads(self, tokens: torch.Tensor,
+                                             attention_head_ids: Optional[List[int]] = None) -> Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        """
+        计算所有层指定 Attention Heads (0-31) 的 Q, K, V 值
+        
+        这个方法使用全部 32 个 attention heads 进行计算，提供更细粒度的分布式计算支持。
+        
+        Args:
+            tokens: 输入 token IDs [batch, seq_len]
+            attention_head_ids: 要计算的 Attention Head IDs (0-31)，None 表示计算所有
+            
+        Returns:
+            {layer_id: {head_id: (q, k, v)}}
+        """
+        x = self.tok_embeddings(tokens)
+        freqs_cis = self.freqs_cis.to(x.device)
+        
+        all_qkv = {}
+        h = x
+        
+        for layer_id, layer in enumerate(self.layers):
+            # 计算该层的 Q, K, V (使用 32 个 attention heads)
+            all_qkv[layer_id] = layer.compute_qkv_for_attention_heads(h, freqs_cis, attention_head_ids)
+            
+            # 继续前向传播
+            h_normed = layer.attention_norm(h)
+            
+            # 计算完整的 KV 用于前向传播
+            full_kv = layer.compute_kv(h, freqs_cis, None)
+            
+            # 使用 KV-Cache 进行前向传播
+            attn_out = layer.attention.forward_with_cache(h_normed, freqs_cis, full_kv)
+            h = h + attn_out
+            h = h + layer.feed_forward(layer.ffn_norm(h))
+        
+        return all_qkv
         
         return all_kv
 
