@@ -263,7 +263,7 @@ class PerformanceVisualizer:
     def generate_breakdown_data(self,
                                  num_heads_offline: int = 2,
                                  seq_length: int = 64,
-                                 heartbeat_interval: float = 0.5,
+                                 heartbeat_interval: float = 0.1,
                                  max_failures: int = 2) -> Tuple[OfflineRecoveryBreakdown, OfflineRecoveryBreakdown]:
         """
         生成耗时分解数据
@@ -278,6 +278,8 @@ class PerformanceVisualizer:
             (kv_cache_breakdown, full_recompute_breakdown)
         """
         print(f"\n[Visualizer] Generating breakdown data...")
+        print(f"  Offline device heads: {num_heads_offline}")
+        print(f"  Total KV heads: {self.n_kv_heads}")
         
         # 心跳检测时间（两种策略相同）
         heartbeat_time = self.simulate_heartbeat_detection(heartbeat_interval, max_failures)
@@ -285,19 +287,23 @@ class PerformanceVisualizer:
         # 任务重分配时间（两种策略相同）
         reassignment_time = self.simulate_task_reassignment(num_heads_offline)
         
+        # 首先测量单个head的计算时间基准
+        # 通过测量全量heads的时间来计算单个head的平均时间
+        total_heads_time = 0
+        for _ in range(3):
+            total_heads_time += self.simulate_inference_step(self.n_kv_heads, seq_length)
+        total_heads_time /= 3
+        
+        # 计算单个head的平均时间
+        time_per_head = total_heads_time / self.n_kv_heads
+        
         # KV-Cache 复用策略的重计算时间
-        # 只需要计算离线设备的heads
-        kv_recompute_time = 0
-        for _ in range(3):  # 多次测量取平均
-            kv_recompute_time += self.simulate_inference_step(num_heads_offline, seq_length)
-        kv_recompute_time /= 3
+        # 只需要重新计算离线设备的heads（其他设备的KV-Cache可以复用）
+        kv_recompute_time = time_per_head * num_heads_offline
         
         # 全量重计算策略的重计算时间
-        # 需要计算所有heads
-        full_recompute_time = 0
-        for _ in range(3):  # 多次测量取平均
-            full_recompute_time += self.simulate_inference_step(self.n_kv_heads, seq_length)
-        full_recompute_time /= 3
+        # 需要清除所有缓存，重新计算所有heads
+        full_recompute_time = total_heads_time
         
         kv_breakdown = OfflineRecoveryBreakdown(
             strategy_name="KV-Cache Reuse",
@@ -315,10 +321,16 @@ class PerformanceVisualizer:
             total_ms=heartbeat_time + reassignment_time + full_recompute_time
         )
         
+        # 计算节省比例
+        recompute_saved = full_recompute_time - kv_recompute_time
+        recompute_saved_percent = (recompute_saved / full_recompute_time) * 100
+        
+        print(f"  Time per head: {time_per_head:.2f}ms")
         print(f"  KV-Cache Reuse: heartbeat={heartbeat_time:.2f}ms, "
-              f"reassign={reassignment_time:.2f}ms, recompute={kv_recompute_time:.2f}ms")
+              f"reassign={reassignment_time:.2f}ms, recompute={kv_recompute_time:.2f}ms (only {num_heads_offline} heads)")
         print(f"  Full Recompute: heartbeat={heartbeat_time:.2f}ms, "
-              f"reassign={reassignment_time:.2f}ms, recompute={full_recompute_time:.2f}ms")
+              f"reassign={reassignment_time:.2f}ms, recompute={full_recompute_time:.2f}ms (all {self.n_kv_heads} heads)")
+        print(f"  Recomputation time saved: {recompute_saved:.2f}ms ({recompute_saved_percent:.1f}%)")
         
         return kv_breakdown, full_breakdown
     
